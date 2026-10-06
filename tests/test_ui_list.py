@@ -128,3 +128,20 @@ def test_quit_does_not_block_ui_while_finalizing(window, monkeypatch, qapp):
         qapp.processEvents()
         time.sleep(0.02)
     assert quits == [1] and window._quit_dialog is None
+
+
+def test_keep_recent_setting_asks_before_deleting(window, monkeypatch, tmp_path):
+    st = window.storage
+    for day in range(1, 4):
+        f = tmp_path / f"g{day}"
+        f.mkdir()
+        (f / "video.mp4").write_bytes(b"v")
+        st.create_game(folder=str(f), status="ready", video_path=str(f / "video.mp4"),
+                       started_at=f"2026-10-0{day}T20:00:00")
+    window.settings.keep_recent_videos = 1
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+    assert not window._apply_keep_recent()
+    assert sum(g.has_video for g in st.list_games()) == 3
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    assert window._apply_keep_recent()
+    assert [g.has_video for g in st.list_games()] == [True, False, False]

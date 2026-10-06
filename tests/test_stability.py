@@ -220,3 +220,24 @@ def test_finalize_without_space_keeps_segments_and_retries(tmp_path, monkeypatch
     assert g.status == "ready" and g.has_video and g.note is None
     loaded, offset, _ = ev.load_events(folder / "events.json")
     assert offset == 2.0 and loaded[0].video_time == 7.0
+
+
+def test_keep_recent_videos(tmp_path):
+    st = Storage(tmp_path / "db.sqlite", tmp_path / "data")
+    ids = []
+    for day in range(1, 8):
+        f = tmp_path / f"g{day}"
+        f.mkdir()
+        (f / "video.mp4").write_bytes(b"v")
+        ids.append(st.create_game(folder=str(f), status="ready", video_path=str(f / "video.mp4"),
+                                  started_at=f"2026-10-0{day}T20:00:00"))
+    failed = st.create_game(folder=str(tmp_path / "g0"), status="failed", started_at="2026-09-01")
+    assert watcher_mod.enforce_keep_recent(st, 0) == []
+    removed = watcher_mod.enforce_keep_recent(st, 5)
+    assert removed == [ids[1], ids[0]]  # 가장 오래된 2경기
+    assert all(st.get_game(i).has_video for i in ids[2:])
+    assert not (tmp_path / "g1" / "video.mp4").exists()
+    g = st.get_game(ids[0])
+    assert g.status == "none" and "최근 5경기" in g.note
+    assert st.get_game(failed).status == "failed"
+    assert watcher_mod.enforce_keep_recent(st, 5) == []

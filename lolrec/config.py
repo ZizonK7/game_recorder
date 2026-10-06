@@ -33,6 +33,7 @@ class Settings:
     record_game_audio: bool = True
     ranked_only: bool = False
     max_storage_gb: float = 100.0
+    keep_recent_videos: int = 0  # 최근 N경기 영상만 보관 (0 = 끄기). 경기 데이터는 유지
 
     # 데스 리플레이
     death_replay_enabled: bool = True

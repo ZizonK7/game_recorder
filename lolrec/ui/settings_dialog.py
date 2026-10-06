@@ -94,7 +94,14 @@ class SettingsDialog(QDialog):
         self.max_storage.setSuffix(" GB")
         self.max_storage.setValue(s.max_storage_gb)
         f.addRow("최대 저장 용량 (0=무제한)", self.max_storage)
-        note = QLabel("용량을 넘으면 오래된 영상부터 삭제됩니다. 경기 데이터는 유지됩니다.\n"
+        self.keep_recent = QSpinBox()
+        self.keep_recent.setRange(0, 1000)
+        self.keep_recent.setSpecialValueText("끄기 (모두 보관)")
+        self.keep_recent.setSuffix(" 경기")
+        self.keep_recent.setValue(s.keep_recent_videos)
+        f.addRow("최근 경기 영상만 보관", self.keep_recent)
+        note = QLabel("용량을 넘거나 보관 경기 수를 넘으면 오래된 영상부터 자동 삭제됩니다.\n"
+                      "경기 기록과 통계(대시보드)는 유지됩니다.\n"
                       "게임 성능을 위해 720p · 30fps · 자동 인코더(그래픽카드)를 권장합니다.")
         note.setObjectName("muted")
         f.addRow(note)
@@ -226,6 +233,7 @@ class SettingsDialog(QDialog):
         s.record_game_audio = self.audio.isChecked()
         s.ranked_only = self.ranked.isChecked()
         s.max_storage_gb = self.max_storage.value()
+        s.keep_recent_videos = self.keep_recent.value()
         s.death_replay_enabled = self.replay_on.isChecked()
         s.replay_before_sec = self.before.value()
         s.replay_after_sec = self.after.value()

@@ -25,7 +25,7 @@ from ..config import Settings, save_settings
 from ..exporter import export_games
 from ..fetcher import MatchFetcher
 from ..storage import GameRow, Storage
-from ..watcher import GameWatcher, PipelineCache
+from ..watcher import GameWatcher, PipelineCache, enforce_keep_recent, videos_over_keep
 from . import theme
 from .dashboard import Dashboard
 from .overlay import ReplayOverlay
@@ -365,10 +365,13 @@ class MainWindow(QMainWindow):
         old = (self.settings.encoder, self.settings.fps, self.settings.bitrate_kbps, self.settings.resolution,
                self.settings.monitor_index)
         old_dir = self.settings.recordings_dir
+        old_keep = self.settings.keep_recent_videos
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec():
             if self.settings.recordings_dir != old_dir:
                 self._move_raw_data()
+            if self.settings.keep_recent_videos != old_keep and not self._apply_keep_recent():
+                self.settings.keep_recent_videos = old_keep
             new = (self.settings.encoder, self.settings.fps, self.settings.bitrate_kbps, self.settings.resolution,
                    self.settings.monitor_index)
             if old != new:
@@ -382,6 +385,26 @@ class MainWindow(QMainWindow):
                 log.exception("자동 실행 설정 실패")
             if self.watcher.recording and old != new:
                 self._set_status("녹화 설정 변경은 다음 게임부터 적용됩니다")
+
+    def _apply_keep_recent(self) -> bool:
+        """'최근 N경기만 보관'을 바로 적용. 지워질 영상이 있으면 먼저 확인받는다. 취소하면 False."""
+        keep = self.settings.keep_recent_videos
+        targets = videos_over_keep(self.storage, keep)
+        if not targets:
+            return True
+        oldest = min((g.started_dt for g in targets if g.started_dt), default=None)
+        since = f"\n(가장 오래된 영상: {oldest:%Y-%m-%d})" if oldest else ""
+        if QMessageBox.question(self, "영상 자동 삭제",
+                                f"최근 {keep}경기 영상만 남기고 이전 영상 {len(targets)}개를 지금 삭제합니다.{since}\n"
+                                "경기 기록과 통계는 유지됩니다. 계속할까요?") != QMessageBox.Yes:
+            return False
+        if self._loaded and any(g.id == self._loaded[0] for g in targets):
+            self.player.unload()  # 재생 중인 파일은 지울 수 없음
+            self._loaded = None
+        removed = enforce_keep_recent(self.storage, keep)
+        self.refresh_list()
+        self._set_status(f"오래된 영상 {len(removed)}개를 삭제했습니다")
+        return True
 
     def _move_raw_data(self) -> None:
         """저장 위치가 바뀌면 원본 API 데이터도 새 위치로 옮긴다 (기존 녹화 폴더는 그대로 둠)."""

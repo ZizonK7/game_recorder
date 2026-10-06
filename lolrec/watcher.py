@@ -29,7 +29,7 @@ from .recorder.ffmpeg import (
 )
 from .riot.api import match_id_for, normalize_platform
 from .riot.local import GameSessionInfo, LcuClient, LiveClient, game_pid, game_window_mode, read_session
-from .storage import Storage
+from .storage import GameRow, Storage
 
 log = logging.getLogger(__name__)
 
@@ -469,9 +469,11 @@ class GameWatcher(QObject):
                 else:
                     # 합치기에 실패하면 조각은 남겨두어 데이터 손실을 막는다
                     self.storage.update_game(game_row, status="failed", note="조각 합치기 실패 - segments 폴더 확인")
+                # 목록이 갱신되기 전에 자동 삭제를 끝내 둔다
+                enforce_keep_recent(self.storage, self.settings.keep_recent_videos)
+                enforce_storage_limit(self.storage, self.settings.max_storage_gb)
                 self.recording_finished.emit(game_row)
                 self.status_changed.emit("녹화 저장 완료")
-                enforce_storage_limit(self.storage, self.settings.max_storage_gb)
         except Exception as e:
             log.exception("녹화 정리 실패")
             self.storage.update_game(game_row, status="failed", note=str(e))
@@ -510,6 +512,33 @@ def folder_size(path: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+def videos_over_keep(storage: Storage, keep: int) -> list[GameRow]:
+    """'최근 N경기 영상만 보관' 설정에 따라 지워질 (오래된) 영상 목록."""
+    if keep <= 0:
+        return []
+    videos = [g for g in storage.list_games() if g.status == "ready" and g.has_video]
+    videos.sort(key=lambda g: g.started_at or "", reverse=True)
+    return videos[keep:]
+
+
+def enforce_keep_recent(storage: Storage, keep: int) -> list[int]:
+    """최근 keep 경기의 영상만 남기고 이전 영상은 삭제 (경기 기록/통계는 유지). 지운 game id 목록 반환."""
+    removed = []
+    for g in videos_over_keep(storage, keep):
+        try:
+            Path(g.video_path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:  # 재생 중이라 잠겨 있는 등 -> 다음에 다시 시도
+            log.warning("영상 자동 삭제 실패: %s", g.video_path, exc_info=True)
+            continue
+        storage.update_game(g.id, video_path=None, status="none", note=f"최근 {keep}경기만 보관 설정으로 영상 자동 삭제")
+        removed.append(g.id)
+    if removed:
+        log.info("최근 %d경기만 보관: 영상 %d개 삭제", keep, len(removed))
+    return removed
 
 
 def enforce_storage_limit(storage: Storage, max_gb: float, reserve_bytes: int = 0) -> tuple[list[int], bool]:
