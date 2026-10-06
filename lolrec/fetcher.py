@@ -13,7 +13,7 @@ from PySide6.QtCore import QObject, Signal
 from . import analysis
 from . import events as ev
 from .config import Settings, get_api_key
-from .riot.api import RiotApi, RiotApiError
+from .riot.api import RequestCancelled, RiotApi, RiotApiError
 from .storage import Storage
 
 log = logging.getLogger(__name__)
@@ -43,12 +43,19 @@ class MatchFetcher(QObject):
         for g in self.storage.pending_api_games():
             self.enqueue(g.id, immediate=True)
 
-    def stop(self, timeout: float = 30.0) -> None:
-        """진행 중인 요청이 끝날 때까지 기다린다 (요청마다 타임아웃이 있어 오래 걸리지 않음)."""
+    def stop(self, timeout: float | None = None) -> bool:
+        """작업자를 멈추고 실제로 끝날 때까지 기다린다. 끝났으면 True.
+
+        재시도/요청 제한 대기는 즉시 중단되고, 진행 중인 HTTP 요청은 요청 타임아웃 안에 끝난다.
+        """
         self._stop.set()
         self._queue.put(None)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout)
+        stopped = not (self._thread and self._thread.is_alive())
+        if not stopped:
+            log.warning("Riot API 작업자가 제한 시간 안에 끝나지 않음")
+        return stopped
 
     def enqueue(self, game_row_id: int, immediate: bool = False) -> None:
         self._queue.put(("game", game_row_id, 0 if immediate else RETRY_DELAYS[0], 0))
@@ -60,7 +67,7 @@ class MatchFetcher(QObject):
         key = get_api_key()
         if not key:
             return None
-        return RiotApi(key, self.settings.region if self.settings.region != "auto" else "KR")
+        return RiotApi(key, self.settings.region if self.settings.region != "auto" else "KR", cancel=self._stop)
 
     # ------------------------------------------------------------------ loop
     def _run(self) -> None:
@@ -90,6 +97,8 @@ class MatchFetcher(QObject):
                 elif kind == "import":
                     _, count, queue_id, _ = job
                     self._import(count, queue_id)
+            except RequestCancelled:
+                break  # 앱 종료 중
             except Exception as e:
                 log.exception("Riot API 작업 실패")
                 self.error.emit(f"Riot API 오류: {e}")

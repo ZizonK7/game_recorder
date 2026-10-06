@@ -103,6 +103,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(make_icon())
         self.resize(1400, 860)
         self._quitting = False
+        self.shutdown_clean = False  # 백그라운드 작업이 모두 끝난 뒤 종료했는지 (DB 를 닫아도 되는지)
         self._quit_dialog: QProgressDialog | None = None
         self._shutdown_done.connect(self._finish_quit)
 
@@ -535,8 +536,8 @@ class MainWindow(QMainWindow):
 
     def _shutdown_worker(self) -> None:
         try:
-            self.watcher.stop()
-            self.fetcher.stop()
+            self.watcher.stop()  # 영상 정리까지 끝날 때까지 대기
+            self.shutdown_clean = self.fetcher.stop()  # API 작업자가 실제로 끝났는지
         except Exception:
             log.exception("종료 처리 중 오류")
         finally:

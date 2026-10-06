@@ -58,6 +58,10 @@ class RiotApiError(Exception):
         self.status = status
 
 
+class RequestCancelled(Exception):
+    """앱 종료 등으로 요청 대기를 중단함."""
+
+
 class RateLimiter:
     """여러 개의 (횟수, 초) 제한을 동시에 지키는 슬라이딩 윈도우 리미터."""
 
@@ -97,24 +101,38 @@ class RateLimiter:
 
 class RiotApi:
     def __init__(self, api_key: str, platform: str = "KR",
-                 limits: list[tuple[int, float]] | None = None, timeout: float = 10.0):
+                 limits: list[tuple[int, float]] | None = None, timeout: float = 10.0,
+                 cancel: threading.Event | None = None):
         self.api_key = api_key.strip()
         self.platform = normalize_platform(platform)
-        self.limiter = RateLimiter(limits or [(20, 1.0), (100, 120.0)])
+        self.cancel = cancel  # set 되면 재시도/요청 제한 대기를 즉시 멈춘다
+        self.limiter = RateLimiter(limits or [(20, 1.0), (100, 120.0)], sleep=self._sleep)
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers["X-Riot-Token"] = self.api_key
 
     # ------------------------------------------------------------------ base
+    def _sleep(self, seconds: float) -> None:
+        if self.cancel is None:
+            time.sleep(seconds)
+        elif self.cancel.wait(seconds):
+            raise RequestCancelled()
+
+    def _check_cancel(self) -> None:
+        if self.cancel is not None and self.cancel.is_set():
+            raise RequestCancelled()
+
     def _get(self, url: str, params: dict | None = None, retries: int = 3):
         for attempt in range(retries + 1):
+            self._check_cancel()
             self.limiter.acquire()
+            self._check_cancel()
             try:
                 r = self.session.get(url, params=params, timeout=self.timeout)
             except requests.RequestException as e:
                 if attempt >= retries:
                     raise RiotApiError(0, f"네트워크 오류: {e}") from e
-                time.sleep(2 ** attempt)
+                self._sleep(2 ** attempt)
                 continue
             if r.status_code == 200:
                 return r.json()
@@ -124,7 +142,7 @@ class RiotApi:
                 self.limiter.block_for(wait)
                 continue
             if r.status_code in (500, 502, 503, 504) and attempt < retries:
-                time.sleep(2 ** attempt)
+                self._sleep(2 ** attempt)
                 continue
             raise RiotApiError(r.status_code, _error_message(r))
         raise RiotApiError(429, "요청 제한으로 재시도 횟수를 초과했습니다")

@@ -105,7 +105,12 @@ def main() -> int:
     if not (settings.start_minimized or "--minimized" in sys.argv):
         window.show()
     code = app.exec()
-    storage.close()
+    if window.shutdown_clean:
+        storage.close()
+    else:
+        # 강제 종료 등으로 아직 DB 를 쓰는 작업이 있을 수 있다. 매 변경마다 commit 하므로
+        # 닫지 않고 끝내도 데이터는 남는다 (닫으면 남은 작업이 오류를 낸다).
+        log.warning("백그라운드 작업이 끝나지 않은 상태로 종료 - DB 연결을 닫지 않음")
     return code
 
 

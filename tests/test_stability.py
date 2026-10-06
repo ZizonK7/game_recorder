@@ -262,3 +262,54 @@ def test_keep_recent_counts_matches_not_sessions(tmp_path):
     assert [g.id for g in watcher_mod.plan_keep_recent(st, 1)] == [c, a]
     assert watcher_mod.enforce_keep_recent(st, 1) == [c, a]
     assert st.get_game(b1).has_video and st.get_game(b2).has_video
+
+
+def test_api_wait_is_cancelled_immediately():
+    from lolrec.riot.api import RequestCancelled, RiotApi
+
+    cancel = threading.Event()
+    api = RiotApi("key", cancel=cancel)
+    api.limiter.block_for(100)  # 429 를 받아 100초 기다리는 중
+    threading.Timer(0.2, cancel.set).start()
+    started = time.monotonic()
+    with pytest.raises(RequestCancelled):
+        api.match("KR_1")
+    assert time.monotonic() - started < 2
+
+
+def test_fetcher_stop_waits_until_worker_exits(tmp_path, monkeypatch):
+    from lolrec.fetcher import MatchFetcher
+    from lolrec.riot.api import RiotApi
+
+    st = Storage(tmp_path / "db.sqlite", tmp_path / "data")
+    st.create_game(match_id="KR_1", status="none", api_status="pending")
+    f = MatchFetcher(Settings(recordings_dir=str(tmp_path / "rec")), st)
+    entered = threading.Event()
+
+    def blocked_api():
+        api = RiotApi("key", cancel=f._stop)
+        api.limiter.block_for(100)
+        entered.set()
+        return api
+
+    monkeypatch.setattr(f, "api", blocked_api)
+    f.start()
+    assert entered.wait(5)
+    started = time.monotonic()
+    assert f.stop() is True
+    assert time.monotonic() - started < 3 and not f._thread.is_alive()
+    st.close()  # 작업자가 끝난 뒤라 안전
+
+
+def test_fetcher_stop_reports_timeout(tmp_path, monkeypatch):
+    from lolrec.fetcher import MatchFetcher
+
+    st = Storage(tmp_path / "db.sqlite", tmp_path / "data")
+    st.create_game(match_id="KR_1", status="none", api_status="pending")
+    f = MatchFetcher(Settings(recordings_dir=str(tmp_path / "rec")), st)
+    busy = threading.Event()
+    monkeypatch.setattr(f, "_fetch_game", lambda gid, attempt: (busy.set(), time.sleep(1.5)) and None)
+    f.start()
+    assert busy.wait(5)
+    assert f.stop(timeout=0.2) is False  # 끝나지 않았으면 정상 종료로 보지 않는다
+    assert f.stop() is True
