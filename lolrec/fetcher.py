@@ -43,9 +43,12 @@ class MatchFetcher(QObject):
         for g in self.storage.pending_api_games():
             self.enqueue(g.id, immediate=True)
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 30.0) -> None:
+        """진행 중인 요청이 끝날 때까지 기다린다 (요청마다 타임아웃이 있어 오래 걸리지 않음)."""
         self._stop.set()
         self._queue.put(None)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout)
 
     def enqueue(self, game_row_id: int, immediate: bool = False) -> None:
         self._queue.put(("game", game_row_id, 0 if immediate else RETRY_DELAYS[0], 0))
@@ -173,6 +176,8 @@ class MatchFetcher(QObject):
         ids = api.match_ids(puuid, count=count, queue=queue_id)
         added = 0
         for i, mid in enumerate(ids, 1):
+            if self._stop.is_set():
+                break
             self.status.emit(f"과거 경기 가져오는 중 {i}/{len(ids)}")
             existing = self.storage.find_by_match_id(mid)
             if existing and existing.api_status == "done":

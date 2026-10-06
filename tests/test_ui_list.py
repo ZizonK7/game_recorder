@@ -102,3 +102,29 @@ def test_relocate_and_import_raw_data(tmp_path):
     assert st2.import_data_from(new) == 2
     assert st2.load_match("KR_1") is not None and st2.load_timeline("KR_1") is not None
     assert st2.import_data_from(st2.data_dir) == 0
+
+
+def test_quit_does_not_block_ui_while_finalizing(window, monkeypatch, qapp):
+    import threading
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    release = threading.Event()
+    monkeypatch.setattr(type(window.watcher), "busy", property(lambda self: True))
+    monkeypatch.setattr(window.watcher, "stop", lambda: release.wait(5))
+    monkeypatch.setattr(window.fetcher, "stop", lambda: None)
+    quits = []
+    monkeypatch.setattr(QApplication, "quit", staticmethod(lambda: quits.append(1)))
+
+    started = time.monotonic()
+    window.quit()
+    assert time.monotonic() - started < 1  # 정리를 기다리느라 UI 스레드가 멈추지 않는다
+    assert window._quit_dialog is not None and quits == []
+
+    release.set()
+    end = time.monotonic() + 3
+    while not quits and time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(0.02)
+    assert quits == [1] and window._quit_dialog is None

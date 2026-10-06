@@ -34,8 +34,29 @@ from .storage import Storage
 log = logging.getLogger(__name__)
 
 
+GB = 1024 ** 3
+# 녹화 중 남은 공간이 이보다 적으면 녹화를 멈춘다 (지금까지 녹화한 부분은 저장)
+STOP_FREE_BYTES = 1 * GB
+# 한 판을 녹화할 때 예상하는 최대 길이 (용량 확보 / 공간 경고 기준)
+EXPECTED_GAME_SEC = 45 * 60
+# 공간 부족으로 합치지 못한 녹화의 note 접두어. 다음 실행 때 다시 합치기를 시도한다.
+NOTE_NO_SPACE = "디스크 공간 부족으로 영상 합치기 못함"
+
+
 def safe_name(text: str) -> str:
     return "".join(c for c in text if c.isalnum() or c in "-_ ").strip() or "game"
+
+
+def free_bytes(path: Path) -> int | None:
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def expected_game_bytes(bitrate_kbps: int) -> int:
+    # 영상 + 오디오(160k), 합칠 때는 조각과 결과 mp4 가 잠시 같이 있으므로 호출하는 쪽에서 2배로 본다
+    return int((bitrate_kbps + 160) * 1000 / 8 * EXPECTED_GAME_SEC)
 
 
 class PipelineCache:
@@ -98,6 +119,9 @@ class GameWatcher(QObject):
         self._thread: threading.Thread | None = None
         self.on_game_processed = None  # 콜백: 녹화 정리 후 API 수집 요청 (game row id)
         self.recording = False
+        # 녹화가 끝난 뒤 도는 작업(영상 정리, 데스 리플레이). 앱 종료 시 끝날 때까지 기다린다.
+        self._workers: set[threading.Thread] = set()
+        self._workers_lock = threading.Lock()
         # 데스 리플레이 세대: 부활/게임 종료 때 올려서, 늦게 완성된 리플레이가 뜨지 않게 한다.
         # 확인과 시그널 발생을 같은 락 안에서 해야 respawned 보다 늦게 재생 시그널이 도착하지 않는다.
         self._replay_gen = 0
@@ -109,9 +133,37 @@ class GameWatcher(QObject):
         self._thread.start()
 
     def stop(self) -> None:
+        """감지 루프와 남은 작업(영상 정리 등)이 끝날 때까지 기다린다. UI 스레드에서 부르지 말 것."""
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=180)
+            self._thread.join()
+        while True:
+            with self._workers_lock:
+                workers = list(self._workers)
+            if not workers:
+                break
+            for t in workers:
+                t.join()
+
+    @property
+    def busy(self) -> bool:
+        """녹화 중이거나 영상 정리가 남아 있는지."""
+        with self._workers_lock:
+            finalizing = any(t.name == "finalize" for t in self._workers)
+        return self.recording or finalizing
+
+    def _start_worker(self, target, args: tuple = (), name: str = "worker") -> None:
+        def run():
+            try:
+                target(*args)
+            finally:
+                with self._workers_lock:
+                    self._workers.discard(threading.current_thread())
+
+        t = threading.Thread(target=run, daemon=True, name=name)
+        with self._workers_lock:
+            self._workers.add(t)
+        t.start()
 
     def _run(self) -> None:
         try:
@@ -184,6 +236,8 @@ class GameWatcher(QObject):
         who = ev.PlayerIdentity(me_name or "", players)
         champion = next((p.get("championName", "") for p in players if who.is_me(p.get("riotId") or p.get("summonerName"))), "")
 
+        self._prepare_space()
+
         started = datetime.now()
         folder = s.recordings_path / f"{started:%Y-%m-%d_%H%M%S}_{safe_name(champion or 'LoL')}"
         folder.mkdir(parents=True, exist_ok=True)
@@ -228,6 +282,7 @@ class GameWatcher(QObject):
         game_ended_at: float | None = None
         death_count = 0
         dead = False
+        last_space_check = time.monotonic()
 
         try:
             while not self._stop.is_set():
@@ -235,6 +290,13 @@ class GameWatcher(QObject):
                 if not recorder.is_running():
                     self.error.emit("녹화 프로세스가 예기치 않게 종료되었습니다 (ffmpeg.log 확인)")
                     break
+                if time.monotonic() - last_space_check > 15:
+                    last_space_check = time.monotonic()
+                    free = free_bytes(folder)
+                    if free is not None and free < STOP_FREE_BYTES:
+                        self.error.emit("디스크 공간이 부족해 녹화를 중지했습니다. 지금까지 녹화한 부분은 저장합니다.")
+                        self.storage.update_game(game_row, note="디스크 공간 부족으로 녹화 중지")
+                        break
 
                 stats = self.live.game_stats()
                 vt = recorder.video_time_now()
@@ -299,8 +361,24 @@ class GameWatcher(QObject):
             # 앱 종료 중이면 정리가 끝날 때까지 기다린다
             self._finalize(*args)
             return
-        threading.Thread(target=self._finalize, args=args, daemon=True, name="finalize").start()
+        self._start_worker(self._finalize, args, name="finalize")
         self._wait_game_end()
+
+    def _prepare_space(self) -> None:
+        """녹화 시작 전에 용량 제한을 맞추고, 남은 공간이 부족하면 미리 알린다."""
+        s = self.settings
+        need = expected_game_bytes(s.bitrate_kbps)
+        try:
+            removed, over = enforce_storage_limit(self.storage, s.max_storage_gb, reserve_bytes=need)
+            if over:
+                self.error.emit("녹화 폴더가 용량 제한을 넘었지만 자동으로 지울 영상이 없습니다 "
+                                "(실패한 녹화의 segments 폴더 등을 확인하세요)")
+        except Exception:
+            log.exception("용량 제한 적용 실패")
+        free = free_bytes(s.recordings_path)
+        if free is not None and free < need * 2:
+            self.error.emit(f"디스크 남은 공간이 {free / GB:.1f} GB 입니다. "
+                            "긴 게임은 녹화나 영상 정리가 중간에 멈출 수 있습니다.")
 
     def _is_alive(self, who: ev.PlayerIdentity) -> bool:
         for p in self.live.player_list():
@@ -350,7 +428,7 @@ class GameWatcher(QObject):
                     return
                 self.death_replay_ready.emit(str(clip.path), clip.seek, clip.length)
 
-        threading.Thread(target=work, daemon=True, name="death-replay").start()
+        self._start_worker(work, name="death-replay")
 
     # ------------------------------------------------------------------ finalize
     def _finalize(self, game_row: int, ffmpeg: Path, seg_dir: Path, folder: Path,
@@ -358,26 +436,42 @@ class GameWatcher(QObject):
         try:
             video = folder / "video.mp4"
             segs = sorted(seg_dir.glob("seg_*.ts"))
-            ok = concat_segments(ffmpeg, segs, video)
-            duration = probe_duration(ffmpeg, video) if ok else None
-            visible = []
-            for e in collected:
-                vt = e.game_time + offset
-                if vt < 0 or (duration and vt > duration + 1):
-                    continue
-                e.video_time = min(vt, duration) if duration else vt
-                visible.append(e)
-            ev.save_events(folder / "events.json", visible, offset, {"me": me_name})
-            if ok:
-                shutil.rmtree(seg_dir, ignore_errors=True)
-                shutil.rmtree(folder / "deaths", ignore_errors=True)
-                self.storage.update_game(game_row, status="ready", video_path=str(video), duration_sec=duration)
+            # 합치는 동안 조각과 mp4 가 같이 있으므로 조각 크기만큼 여유가 있어야 한다
+            seg_bytes = sum(p.stat().st_size for p in segs if p.exists())
+            free = free_bytes(folder)
+            if free is not None and free < seg_bytes + 256 * 1024 ** 2:
+                # 조각과 원래 이벤트(게임 시간 기준)를 그대로 두고, 다음 실행 때 다시 합치기를 시도한다
+                ev.save_events(folder / "events.json", collected, offset, {"me": me_name, "partial": True})
+                self.storage.update_game(game_row, status="failed",
+                                         note=f"{NOTE_NO_SPACE} ({seg_bytes / GB:.1f} GB 필요) - "
+                                              "공간을 확보한 뒤 프로그램을 다시 켜면 segments 폴더에서 다시 합칩니다")
+                self.error.emit("디스크 공간이 부족해 영상을 합치지 못했습니다. 녹화 조각은 보존했습니다.")
+                self.recording_finished.emit(game_row)
             else:
-                # 합치기에 실패하면 조각은 남겨두어 데이터 손실을 막는다
-                self.storage.update_game(game_row, status="failed", note="조각 합치기 실패 - segments 폴더 확인")
-            self.recording_finished.emit(game_row)
-            self.status_changed.emit("녹화 저장 완료")
-            enforce_storage_limit(self.storage, self.settings.max_storage_gb)
+                ok = concat_segments(ffmpeg, segs, video)
+                duration = probe_duration(ffmpeg, video) if ok else None
+                visible = []
+                for e in collected:
+                    vt = e.game_time + offset
+                    if vt < 0 or (duration and vt > duration + 1):
+                        continue
+                    e.video_time = min(vt, duration) if duration else vt
+                    visible.append(e)
+                ev.save_events(folder / "events.json", visible, offset, {"me": me_name})
+                if ok:
+                    shutil.rmtree(seg_dir, ignore_errors=True)
+                    shutil.rmtree(folder / "deaths", ignore_errors=True)
+                    fields = {"status": "ready", "video_path": str(video), "duration_sec": duration}
+                    prev = self.storage.get_game(game_row)
+                    if prev and (prev.note or "").startswith(NOTE_NO_SPACE):
+                        fields["note"] = None  # 공간 부족으로 미뤘던 합치기가 이번에 성공
+                    self.storage.update_game(game_row, **fields)
+                else:
+                    # 합치기에 실패하면 조각은 남겨두어 데이터 손실을 막는다
+                    self.storage.update_game(game_row, status="failed", note="조각 합치기 실패 - segments 폴더 확인")
+                self.recording_finished.emit(game_row)
+                self.status_changed.emit("녹화 저장 완료")
+                enforce_storage_limit(self.storage, self.settings.max_storage_gb)
         except Exception as e:
             log.exception("녹화 정리 실패")
             self.storage.update_game(game_row, status="failed", note=str(e))
@@ -389,7 +483,8 @@ class GameWatcher(QObject):
         """이전 실행이 녹화/정리 도중 끊겼다면 남은 조각으로 영상을 복구."""
         ffmpeg = ffmpeg_path()
         for g in self.storage.list_games():
-            if g.status not in ("recording", "processing") or not g.folder:
+            retry_no_space = g.status == "failed" and (g.note or "").startswith(NOTE_NO_SPACE)
+            if (g.status not in ("recording", "processing") and not retry_no_space) or not g.folder:
                 continue
             # 한 경기의 복구 실패가 나머지 경기 복구를 막지 않도록 경기별로 처리
             try:
@@ -406,23 +501,46 @@ class GameWatcher(QObject):
                 self.storage.update_game(g.id, status="failed", note=f"복구 실패: {e}")
 
 
-def enforce_storage_limit(storage: Storage, max_gb: float) -> list[int]:
-    """녹화 폴더 전체가 용량 제한을 넘으면 오래된 영상부터 삭제 (경기 데이터는 유지)."""
+def folder_size(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def enforce_storage_limit(storage: Storage, max_gb: float, reserve_bytes: int = 0) -> tuple[list[int], bool]:
+    """녹화 폴더들이 차지하는 전체 용량(조각, 임시 파일, 이벤트 포함)이 제한을 넘으면
+    오래된 완성 영상부터 삭제한다 (경기 데이터는 유지). reserve_bytes 는 곧 녹화할 분량.
+
+    반환: (영상을 지운 game id 목록, 지울 수 있는 영상을 다 지워도 제한을 넘는지)
+    """
     if max_gb <= 0:
-        return []
-    games = [g for g in storage.list_games() if g.has_video]
-    sizes = {g.id: Path(g.video_path).stat().st_size for g in games}
-    total = sum(sizes.values())
-    limit = max_gb * 1024 ** 3
+        return [], False
+    games = storage.list_games()
+    folders = {}
+    for g in games:
+        if g.folder and Path(g.folder).is_dir():
+            folders.setdefault(str(Path(g.folder)), g)
+    total = sum(folder_size(Path(f)) for f in folders) + reserve_bytes
+    limit = max_gb * GB
     removed = []
-    for g in sorted(games, key=lambda g: g.started_at or ""):
+    # 녹화/정리 중이거나 실패한(조각만 남은) 녹화는 자동으로 지우지 않는다
+    candidates = [g for g in games if g.status == "ready" and g.has_video]
+    for g in sorted(candidates, key=lambda g: g.started_at or ""):
         if total <= limit:
             break
         try:
+            size = Path(g.video_path).stat().st_size
             Path(g.video_path).unlink()
-        except OSError:
+        except OSError:  # 재생 중이라 잠겨 있는 등
             continue
-        total -= sizes[g.id]
+        total -= size
         storage.update_game(g.id, video_path=None, status="none", note="용량 제한으로 영상 자동 삭제")
         removed.append(g.id)
-    return removed
+    if removed:
+        log.info("용량 제한으로 영상 %d개 삭제", len(removed))
+    return removed, total > limit

@@ -5,6 +5,7 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QCoreApplication
 
 from lolrec import events as ev
@@ -144,3 +145,78 @@ def test_screen_size_change_invalidates_pipeline_cache(tmp_path):
     assert s.detected_pipeline
     assert cache.set_screen_size((3440, 1440))
     assert s.detected_pipeline == {} and "(3440, 1440)" in cache.key()
+
+
+def test_storage_limit_counts_all_files_and_keeps_failed(tmp_path):
+    st = Storage(tmp_path / "db.sqlite", tmp_path / "data")
+    mb = 1024 ** 2
+
+    def game(name, status, video_mb=0, seg_mb=0):
+        f = tmp_path / name
+        f.mkdir()
+        video = None
+        if video_mb:
+            video = f / "video.mp4"
+            video.write_bytes(b"0" * video_mb * mb)
+        if seg_mb:
+            (f / "segments").mkdir()
+            (f / "segments" / "seg_00000.ts").write_bytes(b"0" * seg_mb * mb)
+        return st.create_game(folder=str(f), status=status, started_at=name,
+                              video_path=str(video) if video else None)
+
+    old = game("2026-01", "ready", video_mb=3)
+    failed = game("2026-02", "failed", seg_mb=3)
+    new = game("2026-03", "ready", video_mb=3)
+    # 영상만 세면 6MB 라 8MB 제한 안이지만, 실패한 조각까지 9MB 라 가장 오래된 영상을 지워야 한다
+    removed, over = watcher_mod.enforce_storage_limit(st, 8 / 1024, reserve_bytes=0)
+    assert removed == [old] and not over
+    assert st.get_game(old).status == "none" and st.get_game(new).has_video
+    assert (tmp_path / "2026-02" / "segments" / "seg_00000.ts").exists()
+    # 곧 녹화할 분량까지 고려하면 남은 영상도 지우고, 그래도 넘으면 알려준다
+    removed, over = watcher_mod.enforce_storage_limit(st, 8 / 1024, reserve_bytes=6 * mb)
+    assert removed == [new] and over
+    assert st.get_game(failed).status == "failed"
+
+
+def test_stop_waits_for_workers(tmp_path):
+    w = _watcher(tmp_path)
+    done = []
+    w._start_worker(lambda: (time.sleep(0.3), done.append(1)), name="finalize")
+    assert w.busy
+    w.stop()
+    assert done == [1] and not w.busy
+
+
+def test_finalize_without_space_keeps_segments_and_retries(tmp_path, monkeypatch):
+    w = _watcher(tmp_path)
+    folder = tmp_path / "game"
+    seg_dir = folder / "segments"
+    seg_dir.mkdir(parents=True)
+    (seg_dir / "seg_00000.ts").write_bytes(b"0" * 1024)
+    gid = w.storage.create_game(folder=str(folder), status="processing", match_id="KR_1")
+    processed = []
+    w.on_game_processed = processed.append
+    monkeypatch.setattr(watcher_mod, "free_bytes", lambda p: 10)
+    monkeypatch.setattr(watcher_mod, "concat_segments", lambda *a, **k: pytest.fail("합치면 안 됨"))
+    events = [ev.GameEvent(type="kill", game_time=5.0, label="킬")]
+    w._finalize(gid, Path("ffmpeg"), seg_dir, folder, events, 2.0, "나")
+    g = w.storage.get_game(gid)
+    assert g.status == "failed" and g.note.startswith(watcher_mod.NOTE_NO_SPACE)
+    assert processed == [gid]  # API 데이터 수집은 그대로 진행
+    assert (seg_dir / "seg_00000.ts").exists()
+
+    # 공간을 확보한 뒤 다시 켜면 합치기를 다시 시도한다
+    monkeypatch.setattr(watcher_mod, "free_bytes", lambda p: 10 ** 12)
+    monkeypatch.setattr(watcher_mod, "ffmpeg_path", lambda: Path("ffmpeg"))
+
+    def fake_concat(ffmpeg, segs, out, timeout=600):
+        out.write_bytes(b"mp4")
+        return True
+
+    monkeypatch.setattr(watcher_mod, "concat_segments", fake_concat)
+    monkeypatch.setattr(watcher_mod, "probe_duration", lambda ffmpeg, video: 60.0)
+    w.recover_unfinished()
+    g = w.storage.get_game(gid)
+    assert g.status == "ready" and g.has_video and g.note is None
+    loaded, offset, _ = ev.load_events(folder / "events.json")
+    assert offset == 2.0 and loaded[0].video_time == 7.0

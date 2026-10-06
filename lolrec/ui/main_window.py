@@ -9,11 +9,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QItemSelection, QItemSelectionModel, QRectF, Qt
+import threading
+
+from PySide6.QtCore import QItemSelection, QItemSelectionModel, QRectF, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMainWindow, QMenu,
-    QMessageBox, QPushButton, QSplitter, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget,
+    QMessageBox, QProgressDialog, QPushButton, QSplitter, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -88,6 +90,7 @@ def set_autostart(enabled: bool) -> None:
 
 class MainWindow(QMainWindow):
     COLUMNS = ["날짜", "챔피언", "큐", "결과", "KDA", "길이", "영상", "데이터"]
+    _shutdown_done = Signal()
 
     def __init__(self, settings: Settings, storage: Storage, screen_size: tuple[int, int]):
         super().__init__()
@@ -97,6 +100,8 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(make_icon())
         self.resize(1400, 860)
         self._quitting = False
+        self._quit_dialog: QProgressDialog | None = None
+        self._shutdown_done.connect(self._finish_quit)
 
         self.pipelines = PipelineCache(settings, screen_size)
         self.watcher = GameWatcher(settings, storage, self.pipelines)
@@ -443,14 +448,52 @@ class MainWindow(QMainWindow):
                               QSystemTrayIcon.Information, 3000)
 
     def quit(self) -> None:
+        if self._quitting:
+            return
         if self.watcher.recording:
             if QMessageBox.question(self, "종료", "녹화 중입니다. 종료하면 지금까지 녹화된 부분만 저장됩니다. 종료할까요?") \
                     != QMessageBox.Yes:
                 return
         self._quitting = True
         self._set_status("종료 중...")
-        self.watcher.stop()
-        self.fetcher.stop()
+        self.player.unload()
+        self.overlay.finish()
+        if self.watcher.busy:
+            # 영상 정리는 몇 분 걸릴 수 있으므로 창을 멈추지 않고 진행 상황만 보여준다
+            dlg = QProgressDialog("녹화한 영상을 정리하고 있습니다.\n끝나면 자동으로 종료됩니다.", "강제 종료", 0, 0)
+            dlg.setWindowTitle(APP_DISPLAY_NAME)
+            dlg.setWindowIcon(make_icon(True))
+            dlg.setMinimumDuration(0)
+            dlg.canceled.connect(self._force_quit)
+            dlg.show()
+            self._quit_dialog = dlg
+        self.hide()
+        threading.Thread(target=self._shutdown_worker, daemon=True, name="shutdown").start()
+
+    def _shutdown_worker(self) -> None:
+        try:
+            self.watcher.stop()
+            self.fetcher.stop()
+        except Exception:
+            log.exception("종료 처리 중 오류")
+        finally:
+            self._shutdown_done.emit()
+
+    def _force_quit(self) -> None:
+        if QMessageBox.question(None, APP_DISPLAY_NAME,
+                                "지금 종료하면 정리 중인 녹화는 다음 실행 때 녹화 조각에서 복구를 시도합니다.\n"
+                                "강제 종료할까요?") != QMessageBox.Yes:
+            if self._quit_dialog:
+                self._quit_dialog.show()
+            return
+        log.warning("사용자가 종료 대기 중 강제 종료")
+        self._finish_quit()
+
+    def _finish_quit(self) -> None:
+        if self._quit_dialog:
+            self._quit_dialog.canceled.disconnect(self._force_quit)
+            self._quit_dialog.close()
+            self._quit_dialog = None
         self.tray.hide()
         from PySide6.QtWidgets import QApplication
 
