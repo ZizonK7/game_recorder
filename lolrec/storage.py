@@ -12,7 +12,7 @@ from pathlib import Path
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_id      TEXT UNIQUE,
+    match_id      TEXT,
     game_id       INTEGER,
     platform      TEXT,
     queue_id      INTEGER,
@@ -29,9 +29,14 @@ CREATE TABLE IF NOT EXISTS games (
     kills         INTEGER,
     deaths        INTEGER,
     assists       INTEGER,
-    note          TEXT
+    note          TEXT,
+    session       INTEGER NOT NULL DEFAULT 1  -- 같은 경기를 앱 재시작 등으로 나눠 녹화한 경우 2, 3 ...
 );
+"""
+
+INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_games_started ON games(started_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_games_match_session ON games(match_id, session);
 """
 
 
@@ -56,6 +61,7 @@ class GameRow:
     deaths: int | None
     assists: int | None
     note: str | None
+    session: int = 1
 
     @property
     def has_video(self) -> bool:
@@ -83,7 +89,24 @@ class Storage:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
+        self._conn.executescript(INDEXES)
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """이전 버전 DB(match_id UNIQUE, session 없음)를 현재 구조로 변환."""
+        cols = [r[1] for r in self._conn.execute("PRAGMA table_info(games)")]
+        if "session" in cols:
+            return
+        old_cols = ", ".join(cols)
+        self._conn.executescript(f"""
+            BEGIN;
+            ALTER TABLE games RENAME TO games_old;
+            {SCHEMA}
+            INSERT INTO games ({old_cols}) SELECT {old_cols} FROM games_old;
+            DROP TABLE games_old;
+            COMMIT;
+        """)
 
     # ------------------------------------------------------------------ games
     def _execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
@@ -113,8 +136,17 @@ class Storage:
 
     def find_by_match_id(self, match_id: str) -> GameRow | None:
         with self._lock:
-            row = self._conn.execute("SELECT * FROM games WHERE match_id = ?", (match_id,)).fetchone()
+            row = self._conn.execute("SELECT * FROM games WHERE match_id = ? ORDER BY session LIMIT 1",
+                                     (match_id,)).fetchone()
         return GameRow(**dict(row)) if row else None
+
+    def next_session(self, match_id: str | None) -> int:
+        """같은 경기의 다음 녹화 번호 (재시작 후 같은 경기에 다시 들어온 경우 2, 3 ...)."""
+        if not match_id:
+            return 1
+        with self._lock:
+            row = self._conn.execute("SELECT MAX(session) FROM games WHERE match_id = ?", (match_id,)).fetchone()
+        return (row[0] or 0) + 1
 
     def list_games(self, limit: int | None = None) -> list[GameRow]:
         sql = "SELECT * FROM games ORDER BY started_at DESC"

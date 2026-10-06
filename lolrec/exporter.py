@@ -96,8 +96,11 @@ def export_games(storage: Storage, games: Iterable[GameRow], out_dir: Path, my_p
     (out_dir / "raw" / "matches").mkdir(parents=True, exist_ok=True)
     (out_dir / "raw" / "timelines").mkdir(parents=True, exist_ok=True)
     participants, teams, frames, events, rec_events = [], [], [], [], []
+    exported: set[str] = set()
     for g in games:
-        if g.match_id:
+        # 같은 경기를 나눠 녹화한 행(session 2 ...)이 있어도 경기 데이터는 한 번만 내보낸다
+        if g.match_id and g.match_id not in exported:
+            exported.add(g.match_id)
             match = storage.load_match(g.match_id)
             timeline = storage.load_timeline(g.match_id)
             if match:

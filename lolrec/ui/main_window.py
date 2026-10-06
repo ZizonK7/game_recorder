@@ -193,7 +193,7 @@ class MainWindow(QMainWindow):
             result = "-" if g.win is None else ("승리" if g.win else "패배")
             values = [
                 dt.strftime("%m/%d %H:%M") if dt else "-",
-                g.champion or "-",
+                (g.champion or "-") + (f" (이어서 {g.session})" if g.session > 1 else ""),
                 queue_name(g.queue_id),
                 result,
                 g.kda_text,

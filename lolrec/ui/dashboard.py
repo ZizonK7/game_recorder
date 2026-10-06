@@ -134,9 +134,12 @@ class Dashboard(QWidget):
     def _load(self) -> list[analysis.GameSummary]:
         out = []
         queues = QUEUE_FILTERS[self.queue_filter.currentText()]
+        seen: set[str] = set()
         for g in self.storage.list_games():
-            if not g.match_id or g.api_status != "done":
+            # 같은 경기를 나눠 녹화한 행(session 2 ...)은 한 번만 집계
+            if not g.match_id or g.api_status != "done" or g.match_id in seen:
                 continue
+            seen.add(g.match_id)
             match = self.storage.load_match(g.match_id)
             if not match:
                 continue

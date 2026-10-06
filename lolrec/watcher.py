@@ -88,6 +88,10 @@ class GameWatcher(QObject):
         self._thread: threading.Thread | None = None
         self.on_game_processed = None  # 콜백: 녹화 정리 후 API 수집 요청 (game row id)
         self.recording = False
+        # 데스 리플레이 세대: 부활/게임 종료 때 올려서, 늦게 완성된 리플레이가 뜨지 않게 한다.
+        # 확인과 시그널 발생을 같은 락 안에서 해야 respawned 보다 늦게 재생 시그널이 도착하지 않는다.
+        self._replay_gen = 0
+        self._replay_lock = threading.Lock()
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -174,8 +178,13 @@ class GameWatcher(QObject):
         folder = s.recordings_path / f"{started:%Y-%m-%d_%H%M%S}_{safe_name(champion or 'LoL')}"
         folder.mkdir(parents=True, exist_ok=True)
 
+        # 경기 도중 앱을 다시 켜면 같은 경기를 별도 녹화(session 2, 3 ...)로 이어서 기록한다
+        match_id = match_id_for(platform, info.game_id) if info.game_id else None
+        session = self.storage.next_session(match_id)
+        if session > 1:
+            log.info("이미 기록된 경기에 다시 들어옴: %s (녹화 %d)", match_id, session)
         game_row = self.storage.create_game(
-            match_id=match_id_for(platform, info.game_id) if info.game_id else None,
+            match_id=match_id, session=session,
             game_id=info.game_id, platform=platform, queue_id=info.queue_id, champion=champion,
             riot_id=me_name, puuid=info.puuid or s.puuid, started_at=started.isoformat(timespec="seconds"),
             folder=str(folder), status="recording", api_status="pending",
@@ -243,9 +252,13 @@ class GameWatcher(QObject):
                     if gev is None:
                         continue
                     collected.append(gev)
-                    # 비정상 종료 대비: 이벤트를 수시로 저장 (offset 은 아직 추정치)
-                    ev.save_events(folder / "events.json", collected,
-                                   statistics.median(offsets) if offsets else 0.0, {"me": me_name, "partial": True})
+                    # 비정상 종료 대비: 이벤트를 수시로 저장 (offset 은 아직 추정치). 실패해도 녹화는 계속
+                    try:
+                        ev.save_events(folder / "events.json", collected,
+                                       statistics.median(offsets) if offsets else 0.0,
+                                       {"me": me_name, "partial": True})
+                    except OSError:
+                        log.warning("녹화 중 이벤트 저장 실패", exc_info=True)
                     if gev.type == "game_end":
                         game_ended_at = time.monotonic()
                     if gev.type == "death" and s.death_replay_enabled and offsets:
@@ -254,13 +267,15 @@ class GameWatcher(QObject):
                         offset = statistics.median(offsets)
                         self._spawn_replay(ffmpeg, recorder, folder, gev.game_time + offset, death_count)
 
-                if dead and s.replay_close_on_respawn and self._is_alive(who):
+                if dead and self._is_alive(who):
                     dead = False
-                    self.respawned.emit()
+                    if s.replay_close_on_respawn:
+                        self._cancel_replays()
 
                 if game_ended_at and time.monotonic() - game_ended_at > 8:
                     break
         finally:
+            self._cancel_replays()  # 게임이 끝나면 만들던 리플레이도 띄우지 않는다
             recorder.stop()
             if audio:
                 audio.stop()
@@ -288,23 +303,42 @@ class GameWatcher(QObject):
             time.sleep(2)
 
     # ------------------------------------------------------------------ death replay
+    def _cancel_replays(self) -> None:
+        """진행 중인 리플레이 작업을 무효화하고 떠 있는 리플레이 창을 닫는다."""
+        with self._replay_lock:
+            self._replay_gen += 1
+            self.respawned.emit()
+
     def _spawn_replay(self, ffmpeg: Path, recorder: FfmpegRecorder, folder: Path, death_vt: float, n: int) -> None:
         s = self.settings
+        with self._replay_lock:
+            gen = self._replay_gen
+
+        def stale() -> bool:
+            return self._stop.is_set() or self._replay_gen != gen
 
         def work():
             target_end = death_vt + s.replay_after_sec
             deadline = time.monotonic() + 15
             segments = recorder.segments()
             while (not segments or segments[-1].end < target_end) and time.monotonic() < deadline:
+                if stale():
+                    return
                 time.sleep(0.25)
                 segments = recorder.segments()
+            if stale():
+                return
             out = folder / "deaths" / f"death_{n:02d}.mp4"
             out.parent.mkdir(exist_ok=True)
             clip = build_replay_clip(ffmpeg, segments, death_vt, s.replay_before_sec, s.replay_after_sec, out)
-            if clip:
-                self.death_replay_ready.emit(str(clip.path), clip.seek, clip.length)
-            else:
+            if not clip:
                 log.warning("데스 리플레이 생성 실패")
+                return
+            with self._replay_lock:
+                if stale():
+                    log.info("이미 부활했거나 게임이 끝나 데스 리플레이를 띄우지 않음")
+                    return
+                self.death_replay_ready.emit(str(clip.path), clip.seek, clip.length)
 
         threading.Thread(target=work, daemon=True, name="death-replay").start()
 
@@ -347,14 +381,19 @@ class GameWatcher(QObject):
         for g in self.storage.list_games():
             if g.status not in ("recording", "processing") or not g.folder:
                 continue
-            folder = Path(g.folder)
-            seg_dir = folder / "segments"
-            if ffmpeg is None or not seg_dir.exists():
-                self.storage.update_game(g.id, status="failed", note="녹화가 중단되었습니다")
-                continue
-            log.info("중단된 녹화 복구: %s", folder)
-            collected, offset, meta = ev.load_events(folder / "events.json")
-            self._finalize(g.id, ffmpeg, seg_dir, folder, collected, offset, meta.get("me"))
+            # 한 경기의 복구 실패가 나머지 경기 복구를 막지 않도록 경기별로 처리
+            try:
+                folder = Path(g.folder)
+                seg_dir = folder / "segments"
+                if ffmpeg is None or not seg_dir.exists():
+                    self.storage.update_game(g.id, status="failed", note="녹화가 중단되었습니다")
+                    continue
+                log.info("중단된 녹화 복구: %s", folder)
+                collected, offset, meta = ev.load_events(folder / "events.json")
+                self._finalize(g.id, ffmpeg, seg_dir, folder, collected, offset, meta.get("me"))
+            except Exception as e:
+                log.exception("중단된 녹화 복구 실패: %s", g.folder)
+                self.storage.update_game(g.id, status="failed", note=f"복구 실패: {e}")
 
 
 def enforce_storage_limit(storage: Storage, max_gb: float) -> list[int]:

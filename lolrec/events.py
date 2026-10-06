@@ -9,9 +9,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
+
+log = logging.getLogger(__name__)
 
 # 이벤트 종류 -> (표시 이름, 색상)
 EVENT_TYPES: dict[str, tuple[str, str]] = {
@@ -284,13 +289,28 @@ def apply_offset(events: list[GameEvent], offset: float, duration: float | None 
 # --------------------------------------------------------------------------- 저장
 
 def save_events(path: Path, events: list[GameEvent], offset: float, meta: dict | None = None) -> None:
+    """임시 파일에 쓴 뒤 교체해서, 쓰는 도중 꺼져도 파일이 반쯤 잘리지 않게 한다."""
     payload = {"offset": offset, "meta": meta or {}, "events": [e.to_dict() for e in events]}
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows: 다른 쪽에서 잠깐 읽고 있는 중
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
 
 
 def load_events(path: Path) -> tuple[list[GameEvent], float, dict]:
+    """이벤트 파일을 읽는다. 손상된 파일이면 경고만 남기고 빈 결과를 돌려준다."""
     if not path.exists():
         return [], 0.0, {}
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    events = [GameEvent.from_dict(d) for d in payload.get("events", [])]
-    return events, float(payload.get("offset", 0.0)), payload.get("meta", {})
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        events = [GameEvent.from_dict(d) for d in payload.get("events", [])]
+        return events, float(payload.get("offset", 0.0)), payload.get("meta", {})
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        log.warning("이벤트 파일이 손상되어 무시합니다: %s", path, exc_info=True)
+        return [], 0.0, {}
