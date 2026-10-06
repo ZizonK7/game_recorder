@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QItemSelection, QItemSelectionModel, QRectF, Qt
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMainWindow, QMenu,
     QMessageBox, QPushButton, QSplitter, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget,
@@ -48,6 +48,15 @@ def make_icon(recording: bool = False) -> QIcon:
     p.drawEllipse(QRectF(18, 18, 28, 28))
     p.end()
     return QIcon(pm)
+
+
+def screen_pixel_size(monitor_index: int) -> tuple[int, int]:
+    """설정한 모니터의 물리 해상도 (배율 적용 전 픽셀). 없는 번호면 첫 번째 모니터."""
+    screens = QGuiApplication.screens()
+    screen = screens[monitor_index] if 0 <= monitor_index < len(screens) else QGuiApplication.primaryScreen()
+    ratio = screen.devicePixelRatio()
+    geo = screen.geometry()
+    return int(round(geo.width() * ratio)), int(round(geo.height() * ratio))
 
 
 def open_folder(path: Path) -> None:
@@ -178,9 +187,25 @@ class MainWindow(QMainWindow):
         self.fetcher.game_updated.connect(self._on_game_updated)
         self.fetcher.import_finished.connect(lambda _: self.refresh_list())
 
+        # 모니터 연결/해상도 변경을 다음 녹화에 반영
+        app = QGuiApplication.instance()
+        app.screenAdded.connect(self._watch_screen)
+        app.screenAdded.connect(lambda _s: self._update_screen_size())
+        app.screenRemoved.connect(lambda _s: self._update_screen_size())
+        for sc in QGuiApplication.screens():
+            self._watch_screen(sc)
+
         self.refresh_list()
         self.watcher.start()
         self.fetcher.start()
+
+    def _watch_screen(self, screen) -> None:
+        screen.geometryChanged.connect(lambda _g: self._update_screen_size())
+
+    def _update_screen_size(self) -> None:
+        size = screen_pixel_size(self.settings.monitor_index)
+        if self.pipelines.set_screen_size(size) and self.watcher.recording:
+            self._set_status("모니터 변경은 다음 게임부터 적용됩니다")
 
     # ------------------------------------------------------------------ list
     def refresh_list(self) -> None:
@@ -343,6 +368,7 @@ class MainWindow(QMainWindow):
                    self.settings.monitor_index)
             if old != new:
                 self.pipelines.invalidate()
+            self._update_screen_size()
             self.player.seek_lead = self.settings.seek_lead_sec
             save_settings(self.settings)
             try:

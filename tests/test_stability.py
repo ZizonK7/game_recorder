@@ -134,3 +134,13 @@ def test_recovery_continues_after_one_game_fails(tmp_path, monkeypatch):
     w.recover_unfinished()
     statuses = {g.folder: g.status for g in w.storage.list_games()}
     assert statuses == {str(folders[0]): "failed", str(folders[1]): "ready"}
+
+
+def test_screen_size_change_invalidates_pipeline_cache(tmp_path):
+    s = Settings(recordings_dir=str(tmp_path / "rec"))
+    cache = PipelineCache(s, (1920, 1080))
+    s.detected_pipeline = {"key": cache.key(), "name": "x264", "vf": None, "codec_args": []}
+    assert not cache.set_screen_size((1920, 1080))
+    assert s.detected_pipeline
+    assert cache.set_screen_size((3440, 1440))
+    assert s.detected_pipeline == {} and "(3440, 1440)" in cache.key()

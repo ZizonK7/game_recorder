@@ -286,6 +286,11 @@ class FfmpegRecorder:
 
 # --------------------------------------------------------------------------- 조각 합치기
 
+def concat_quote(path: Path) -> str:
+    """concat 목록 파일용 따옴표 처리. 작은따옴표는 '\\'' 로 바꿔야 한다 (예: player's recordings)."""
+    return "'" + path.as_posix().replace("'", "'\\''") + "'"
+
+
 def concat_segments(ffmpeg: Path, segments: list[Path], output: Path, timeout: float = 600) -> bool:
     """조각들을 재인코딩 없이 하나의 mp4로 합친다."""
     segments = [s for s in segments if s.exists() and s.stat().st_size > 0]
@@ -294,7 +299,7 @@ def concat_segments(ffmpeg: Path, segments: list[Path], output: Path, timeout: f
     list_path = output.with_suffix(".concat.txt")
     with list_path.open("w", encoding="utf-8") as f:
         for s in segments:
-            f.write(f"file '{s.as_posix()}'\n")
+            f.write(f"file {concat_quote(s)}\n")
     tmp = output.with_name(output.stem + ".part.mp4")
     cmd = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
            "-i", str(list_path), "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", str(tmp)]

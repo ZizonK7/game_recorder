@@ -50,7 +50,7 @@ def main() -> int:
     from .paths import ffmpeg_path
     from .storage import Storage
     from .ui import theme
-    from .ui.main_window import MainWindow
+    from .ui.main_window import MainWindow, screen_pixel_size
 
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
@@ -87,12 +87,8 @@ def main() -> int:
         settings.raw_data_dir = str(data_dir)
         save_settings(settings)
 
-    screens = QGuiApplication.screens()
-    idx = settings.monitor_index if settings.monitor_index < len(screens) else 0
-    screen = screens[idx]
-    ratio = screen.devicePixelRatio()
-    size = (int(screen.geometry().width() * ratio), int(screen.geometry().height() * ratio))
-    log.info("녹화 모니터 %d: %dx%d", idx, *size)
+    size = screen_pixel_size(settings.monitor_index)
+    log.info("녹화 모니터 %d: %dx%d", settings.monitor_index, *size)
 
     window = MainWindow(settings, storage, size)
     server.newConnection.connect(lambda: (server.nextPendingConnection(), window.show_normal()))

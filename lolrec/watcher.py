@@ -67,6 +67,16 @@ class PipelineCache:
         with self._lock:
             self.settings.detected_pipeline = {}
 
+    def set_screen_size(self, size: tuple[int, int]) -> bool:
+        """녹화할 모니터의 실제 해상도가 바뀌면 반영하고 인코더를 다시 탐지하게 한다."""
+        with self._lock:
+            if tuple(size) == tuple(self.screen_size):
+                return False
+            log.info("녹화 모니터 해상도 변경: %s -> %s", self.screen_size, size)
+            self.screen_size = tuple(size)
+            self.settings.detected_pipeline = {}
+            return True
+
 
 class GameWatcher(QObject):
     status_changed = Signal(str)           # 상태 표시줄 문구

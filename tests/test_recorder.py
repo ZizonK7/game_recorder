@@ -110,3 +110,25 @@ def test_record_with_audio_pipe(tmp_path, monkeypatch):
     assert rec.concat_segments(Path(FFMPEG), sorted(r.seg_dir.glob("seg_*.ts")), out)
     info = rec.run_quiet([FFMPEG, "-hide_banner", "-i", str(out)]).stderr.decode()
     assert "Audio: aac" in info and "Video: h264" in info
+
+
+def test_concat_quote():
+    assert rec.concat_quote(Path("/a/b.ts")) == "'/a/b.ts'"
+    assert rec.concat_quote(Path("/player's recordings/seg.ts")) == r"'/player'\''s recordings/seg.ts'"
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="ffmpeg 없음")
+def test_concat_in_folder_with_quote(tmp_path):
+    folder = tmp_path / "player's recordings"
+    folder.mkdir()
+    segs = []
+    for i in range(2):
+        seg = folder / f"seg_{i:05d}.ts"
+        rec.run_quiet([FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                       "testsrc2=size=160x90:rate=10", "-t", "1", "-c:v", "libx264", "-preset", "ultrafast",
+                       "-f", "mpegts", str(seg)], timeout=30)
+        assert seg.exists()
+        segs.append(seg)
+    out = folder / "video.mp4"
+    assert rec.concat_segments(Path(FFMPEG), segs, out)
+    assert out.exists()

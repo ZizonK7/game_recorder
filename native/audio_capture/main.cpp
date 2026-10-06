@@ -1,7 +1,9 @@
 // lol_audio_capture.exe
 //
 // 특정 프로세스(League of Legends.exe)의 소리만 캡처해서 named pipe 로 PCM 을 흘려보내는 헬퍼.
-// Windows 10 2004(빌드 19041) 이상의 Process Loopback API 를 사용한다.
+// Process Loopback API 를 사용한다. Microsoft 문서상 최소 버전은 빌드 20348 이지만
+// 실제로는 Windows 10 2004(빌드 19041) 이상에서 동작한다 (OBS 응용 프로그램 오디오 캡처와 동일).
+// 지원되지 않는 환경에서는 "ERROR ..." 를 출력하고, 앱은 영상만 녹화한다.
 //
 // 사용법: lol_audio_capture.exe --pid <PID> --pipe \\.\pipe\name [--rate 48000] [--channels 2]
 // 표준 출력: "READY" (pipe 준비 완료) 또는 "ERROR <설명>"

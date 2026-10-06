@@ -33,7 +33,12 @@ GitHub Actions에서 빌드된 파일을 받습니다 (Actions → 최신 실행
 - `LoLRecorder-Setup-x.y.z.exe` : 설치 파일 (관리자 권한 불필요)
 - `LoLRecorder-portable-x.y.z.zip` : 압축 풀고 `LoLRecorder.exe` 실행
 
-요구 사항: Windows 10 2004 이상 (게임 소리만 녹음하는 기능에 필요), 64비트.
+요구 사항: Windows 10 2004(빌드 19041) 이상, 64비트.
+
+- 게임 소리만 녹음하는 기능은 Windows 의 Process Loopback API 를 사용합니다. Microsoft 문서상 최소 버전은
+  빌드 20348(Windows 11 / Server 2022 계열)이지만, OBS 의 "응용 프로그램 오디오 캡처"와 마찬가지로
+  Windows 10 2004 이상에서도 동작하는 것으로 알려져 있습니다.
+- 이 기능을 쓸 수 없는 환경에서는 자동으로 **소리 없이 영상만** 녹화하고 알림을 띄웁니다.
 
 ## 처음 설정
 
