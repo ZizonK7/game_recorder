@@ -78,6 +78,8 @@ def main() -> int:
     # 저장 위치를 바꾼 적이 있으면 예전 위치에 남은 원본 데이터를 옮겨 온다.
     # 옮기지 못한 위치는 storage.fallback_dirs 에 남아 계속 읽히고, 다음 실행 때 다시 시도한다.
     old_dirs = [Path(d) for d in settings.raw_data_fallbacks]
+    # 기억하던 예전 위치는 지금 접근할 수 없어도(드라이브 분리 등) 잊지 않고 다음에 다시 시도
+    storage.fallback_dirs = list(dict.fromkeys(old_dirs))
     if settings.raw_data_dir:
         old_dirs.append(Path(settings.raw_data_dir))
     old_dirs += [Path(g.folder).parent / "data" for g in storage.list_games() if g.folder]
@@ -86,7 +88,8 @@ def main() -> int:
             storage.import_data_from(old)
         except Exception:
             log.exception("예전 원본 데이터 이관 실패: %s", old)
-            storage.fallback_dirs.append(old)
+            if old not in storage.fallback_dirs:
+                storage.fallback_dirs.append(old)
     fallbacks = [str(d) for d in storage.fallback_dirs]
     if settings.raw_data_dir != str(data_dir) or settings.raw_data_fallbacks != fallbacks:
         settings.raw_data_dir = str(data_dir)

@@ -115,14 +115,14 @@ def test_partial_relocation_keeps_reading_old_location(tmp_path, monkeypatch):
     st = Storage(tmp_path / "db.sqlite", old)
     st.save_raw("KR_1", make_match("KR_1"), make_timeline(minutes=2))
     st.save_raw("KR_2", make_match("KR_2"), None)
-    real_move = shutil.move
+    real_copy = shutil.copy2
 
     def locked(src, dst):
-        if "KR_1" in src:
+        if "KR_1" in str(src):
             raise PermissionError("다른 프로그램이 사용 중")
-        return real_move(src, dst)
+        return real_copy(src, dst)
 
-    monkeypatch.setattr(storage_mod.shutil, "move", locked)
+    monkeypatch.setattr(storage_mod.shutil, "copy2", locked)
     r = st.relocate_data(new)
     assert r.moved == 1 and len(r.failed) == 2  # KR_2 match 이동, KR_1 match/timeline 실패
     assert st.data_dir == new and st.fallback_dirs == [old]
@@ -134,7 +134,7 @@ def test_partial_relocation_keeps_reading_old_location(tmp_path, monkeypatch):
     assert (new / "matches" / "KR_3.json").exists()
 
     # 다음 실행(잠금 해제 후): 예전 위치를 다시 시도해 모두 옮기면 fallback 에서 빠진다
-    monkeypatch.setattr(storage_mod.shutil, "move", real_move)
+    monkeypatch.setattr(storage_mod.shutil, "copy2", real_copy)
     st2 = Storage(tmp_path / "db.sqlite", new)
     assert st2.import_data_from(old).moved == 2
     assert st2.fallback_dirs == [] and st2.load_match("KR_1") is not None
@@ -150,7 +150,7 @@ def test_move_raw_data_reports_failure_and_remembers_old_dir(window, monkeypatch
     st = window.storage
     old = st.data_dir
     st.save_raw("KR_1", make_match("KR_1"), None)
-    monkeypatch.setattr(storage_mod.shutil, "move", lambda s, d: (_ for _ in ()).throw(PermissionError("잠김")))
+    monkeypatch.setattr(storage_mod.shutil, "copy2", lambda s, d: (_ for _ in ()).throw(PermissionError("잠김")))
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
     monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: pytest.fail("성공으로 표시하면 안 됨"))
@@ -287,3 +287,67 @@ def test_window_fits_small_screens(window, qapp):
     window.resize(1400, 800)
     qapp.processEvents()
     assert window.dashboard._tile_cols == 9
+
+
+
+def test_truncated_copy_is_not_treated_as_moved(tmp_path, monkeypatch):
+    """다른 드라이브로 복사하다 공간이 부족해 잘린 파일이 남는 경우."""
+    import errno
+
+    from lolrec import storage as storage_mod
+
+    old, new = tmp_path / "old" / "data", tmp_path / "new" / "data"
+    st = Storage(tmp_path / "db.sqlite", old)
+    st.save_raw("KR_1", make_match("KR_1"), None)
+
+    def disk_full(src, dst):
+        data = open(src, "rb").read()
+        open(dst, "wb").write(data[: len(data) // 2])  # 절반만 쓰고
+        raise OSError(errno.ENOSPC, "디스크 공간 부족")
+
+    monkeypatch.setattr(storage_mod.shutil, "copy2", disk_full)
+    r = st.relocate_data(new)
+    assert r.moved == 0 and len(r.failed) == 1
+    assert st.fallback_dirs == [old]
+    assert not (new / "matches" / "KR_1.json").exists()  # 잘린 파일을 최종 경로에 남기지 않음
+    assert not list((new / "matches").glob("*.part"))
+    assert (old / "matches" / "KR_1.json").exists()
+    assert st.load_match("KR_1") is not None
+
+
+def test_corrupt_target_is_repaired_from_old_location(tmp_path):
+    old, new = tmp_path / "old" / "data", tmp_path / "new" / "data"
+    st = Storage(tmp_path / "db.sqlite", old)
+    st.save_raw("KR_1", make_match("KR_1"), None)
+    (new / "matches").mkdir(parents=True)
+    (new / "matches" / "KR_1.json").write_text('{"metadata": {"matchId": "KR', encoding="utf-8")  # 예전에 잘린 파일
+
+    st2 = Storage(tmp_path / "db2.sqlite", new)
+    assert st2.load_match("KR_1") is None  # 손상된 파일 때문에 오류를 내지 않는다
+    st2.fallback_dirs = [old]
+    assert st2.load_match("KR_1") is not None  # 예전 위치의 정상 파일을 읽는다
+    r = st2.import_data_from(old)
+    assert r.moved == 1 and r.failed == [] and st2.fallback_dirs == []
+    assert st2.load_match("KR_1")["metadata"]["matchId"] == "KR_1"
+
+
+def test_unreachable_old_location_is_remembered(tmp_path):
+    """외장/네트워크 드라이브가 잠시 빠진 상태로 실행해도 예전 위치를 잊지 않는다."""
+    old, new = tmp_path / "ext" / "data", tmp_path / "new" / "data"
+    st = Storage(tmp_path / "db.sqlite", old)
+    st.save_raw("KR_1", make_match("KR_1"), None)
+    hidden = tmp_path / "ext_unplugged"
+    (tmp_path / "ext").rename(hidden)  # 드라이브 분리
+
+    st2 = Storage(tmp_path / "db2.sqlite", new)
+    st2.fallback_dirs = [old]  # 설정에 기억된 위치
+    r = st2.import_data_from(old)
+    assert r.unreachable == [old] and r.moved == 0
+    assert st2.fallback_dirs == [old]
+
+    hidden.rename(tmp_path / "ext")  # 다시 연결
+    assert st2.load_match("KR_1") is not None
+    r = st2.import_data_from(old)
+    assert r.moved == 1 and st2.fallback_dirs == []
+    # 기억하지 않던(추론한) 위치가 없으면 그냥 무시
+    assert st2.import_data_from(tmp_path / "nowhere" / "data").unreachable == []

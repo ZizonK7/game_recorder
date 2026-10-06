@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import sqlite3
 import threading
@@ -20,6 +21,34 @@ RAW_SUBDIRS = ("matches", "timelines")
 class MoveResult:
     moved: int = 0
     failed: list[Path] = field(default_factory=list)
+    unreachable: list[Path] = field(default_factory=list)  # 지금은 접근할 수 없는 예전 위치 (드라이브 분리 등)
+
+
+def read_json(path: Path) -> dict | None:
+    """JSON 파일을 읽는다. 없거나 손상됐으면 None."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        log.warning("원본 데이터 파일을 읽지 못함 (손상?): %s", path, exc_info=True)
+        return None
+
+
+def copy_verified(src: Path, dst: Path) -> None:
+    """src 를 임시 파일로 복사하고 크기와 JSON 형식을 확인한 뒤에만 dst 로 교체한다.
+
+    중간에 실패하면(디스크 부족 등) dst 는 건드리지 않고 OSError 를 낸다.
+    """
+    tmp = dst.with_name(dst.name + ".part")
+    try:
+        shutil.copy2(src, tmp)
+        if tmp.stat().st_size != src.stat().st_size or read_json(tmp) is None:
+            raise OSError(f"복사본 검증 실패: {dst}")
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
@@ -180,15 +209,14 @@ class Storage:
 
     # ------------------------------------------------------------------ raw json
     def _raw_path(self, sub: str, name: str) -> Path:
-        """원본 JSON 경로. 현재 위치에 없고 아직 옮기지 못한 예전 위치에 있으면 그쪽을 돌려준다."""
+        """원본 JSON 경로. 현재 위치를 먼저 보고, 없거나 손상됐으면 아직 옮기지 못한 예전 위치를 본다."""
         primary = self.data_dir / sub / name
-        if primary.exists():
-            return primary
-        for d in self.fallback_dirs:
-            p = d / sub / name
-            if p.exists():
-                return p
-        return primary
+        candidates = [primary, *(d / sub / name for d in self.fallback_dirs)]
+        existing = [c for c in candidates if c.exists()]
+        for c in existing:
+            if read_json(c) is not None:
+                return c
+        return existing[0] if existing else primary
 
     def match_json_path(self, match_id: str) -> Path:
         return self._raw_path("matches", f"{match_id}.json")
@@ -209,14 +237,13 @@ class Storage:
                 tmp.replace(p)
 
     def load_match(self, match_id: str) -> dict | None:
+        """경기 원본 JSON. 정상 파일이 어디에도 없으면 None (손상된 파일 때문에 오류를 내지 않음)."""
         with self._data_lock:
-            p = self.match_json_path(match_id)
-            return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+            return read_json(self.match_json_path(match_id))
 
     def load_timeline(self, match_id: str) -> dict | None:
         with self._data_lock:
-            p = self.timeline_json_path(match_id)
-            return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+            return read_json(self.timeline_json_path(match_id))
 
     def delete_raw(self, match_id: str) -> None:
         with self._data_lock:
@@ -242,20 +269,30 @@ class Storage:
                     other = self.import_data_from(d)
                     result.moved += other.moved
                     result.failed += other.failed
+                    result.unreachable += other.unreachable
             return result
 
     def import_data_from(self, old_dir: Path) -> MoveResult:
-        """다른 위치에 남아 있는 원본 JSON 을 현재 위치로 옮긴다 (같은 파일이 이미 있으면 그대로 둠).
+        """다른 위치에 남아 있는 원본 JSON 을 현재 위치로 옮긴다.
 
-        모두 옮겼으면 fallback_dirs 에서 빼고, 하나라도 못 옮겼으면 fallback_dirs 에 남긴다.
+        - 파일마다 임시 파일로 복사 -> 크기/JSON 검증 -> 교체한 뒤에만 원본을 지운다.
+        - 새 위치에 이미 정상 파일이 있으면 그대로 두고, 손상된 파일이면 원본으로 다시 복사한다.
+        - 모두 옮겼으면 fallback_dirs 에서 빼고, 하나라도 못 옮겼으면 남긴다.
+        - 기억하던 위치에 지금 접근할 수 없으면(드라이브 분리 등) 이관 완료로 보지 않고 남겨 둔다.
         """
         result = MoveResult()
         with self._data_lock:
             try:
-                if not old_dir.exists() or old_dir.resolve() == self.data_dir.resolve():
+                if old_dir.resolve() == self.data_dir.resolve():
                     self._drop_fallback(old_dir)
                     return result
+                reachable = old_dir.exists()
             except OSError:
+                reachable = False
+            if not reachable:
+                if old_dir in self.fallback_dirs:
+                    log.warning("예전 원본 데이터 위치에 접근할 수 없어 다음에 다시 시도: %s", old_dir)
+                    result.unreachable.append(old_dir)
                 return result
             for sub in RAW_SUBDIRS:
                 src_dir, dst_dir = old_dir / sub, self.data_dir / sub
@@ -270,15 +307,22 @@ class Storage:
                     continue
                 for f in files:
                     dst = dst_dir / f.name
-                    if dst.exists():
-                        continue  # 이미 새 위치에 있음 (예전 파일은 그대로 둠)
+                    if dst.exists() and read_json(dst) is not None:
+                        continue  # 이미 새 위치에 정상 파일이 있음 (예전 파일은 그대로 둠)
+                    if read_json(f) is None:
+                        log.warning("예전 위치의 원본 데이터가 손상되어 옮기지 않음: %s", f)
+                        continue
                     try:
-                        shutil.move(str(f), str(dst))
-                        result.moved += 1
+                        copy_verified(f, dst)
                     except OSError:
                         log.warning("원본 데이터 이동 실패: %s", f, exc_info=True)
-                        if not dst.exists():  # 복사까지 실패한 경우만 (복사 후 원본 삭제 실패는 읽을 수 있음)
-                            result.failed.append(f)
+                        result.failed.append(f)
+                        continue
+                    result.moved += 1
+                    try:
+                        f.unlink()
+                    except OSError:  # 새 위치의 복사본은 검증됐으므로 원본은 남아도 된다
+                        log.warning("옮긴 원본 데이터의 예전 파일을 지우지 못함: %s", f)
                 try:
                     src_dir.rmdir()  # 비었을 때만 지워진다
                 except OSError:

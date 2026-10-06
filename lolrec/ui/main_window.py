@@ -450,6 +450,13 @@ class MainWindow(QMainWindow):
             error = str(e)
         self.settings.raw_data_dir = str(self.storage.data_dir)
         self.settings.raw_data_fallbacks = [str(d) for d in self.storage.fallback_dirs]
+        if result is not None and result.unreachable and not result.failed:
+            QMessageBox.warning(
+                self, "저장 위치",
+                f"원본 경기 데이터 {result.moved}개를 새 위치로 옮겼습니다.\n"
+                "다만 지금 접근할 수 없는 예전 위치가 있어 그곳의 데이터는 나중에 옮깁니다 (드라이브 연결 확인):\n"
+                + "\n".join(str(d) for d in result.unreachable))
+            return
         if result is None or result.failed:
             failed = f"{len(result.failed)}개" if result else "일부"
             detail = f"\n오류: {error}" if result is None else ""
