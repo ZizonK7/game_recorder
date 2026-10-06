@@ -24,14 +24,30 @@ class MoveResult:
     unreachable: list[Path] = field(default_factory=list)  # 지금은 접근할 수 없는 예전 위치 (드라이브 분리 등)
 
 
+def json_state(path: Path) -> str:
+    """JSON 파일 상태: "ok" | "missing" | "corrupt"(내용 손상) | "unreadable"(잠금/권한 등 일시적 I/O 오류).
+
+    이관에서는 손상과 읽기 실패를 구분해야 한다. 읽기 실패는 나중에 다시 시도해야 하는 상태다.
+    """
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+        return "ok"
+    except FileNotFoundError:
+        return "missing"
+    except ValueError:
+        return "corrupt"
+    except OSError:
+        return "unreadable"
+
+
 def read_json(path: Path) -> dict | None:
-    """JSON 파일을 읽는다. 없거나 손상됐으면 None."""
+    """JSON 파일을 읽는다. 없거나, 손상됐거나, 지금 읽을 수 없으면 None (조회용)."""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
-        log.warning("원본 데이터 파일을 읽지 못함 (손상?): %s", path, exc_info=True)
+        log.warning("원본 데이터 파일을 읽지 못함: %s", path, exc_info=True)
         return None
 
 
@@ -307,9 +323,23 @@ class Storage:
                     continue
                 for f in files:
                     dst = dst_dir / f.name
-                    if dst.exists() and read_json(dst) is not None:
+                    dst_state = json_state(dst)
+                    if dst_state == "ok":
                         continue  # 이미 새 위치에 정상 파일이 있음 (예전 파일은 그대로 둠)
-                    if read_json(f) is None:
+                    if dst_state == "unreadable":
+                        # 새 위치 파일을 확인할 수 없으면 덮어쓰지도, 원본을 지우지도 않고 다음에 다시 시도
+                        log.warning("새 위치의 원본 데이터를 읽을 수 없어 나중에 다시 옮김: %s", dst)
+                        result.failed.append(f)
+                        continue
+                    src_state = json_state(f)
+                    if src_state == "missing":
+                        continue
+                    if src_state == "unreadable":
+                        # 잠금/권한 등 일시적인 문제: 손상으로 보지 않고 예전 위치를 기억해 다시 시도
+                        log.warning("예전 위치의 원본 데이터를 지금 읽을 수 없어 나중에 다시 옮김: %s", f)
+                        result.failed.append(f)
+                        continue
+                    if src_state == "corrupt":
                         log.warning("예전 위치의 원본 데이터가 손상되어 옮기지 않음: %s", f)
                         continue
                     try:

@@ -351,3 +351,41 @@ def test_unreachable_old_location_is_remembered(tmp_path):
     assert r.moved == 1 and st2.fallback_dirs == []
     # 기억하지 않던(추론한) 위치가 없으면 그냥 무시
     assert st2.import_data_from(tmp_path / "nowhere" / "data").unreachable == []
+
+
+def test_unreadable_source_is_retried_not_dropped(tmp_path, monkeypatch):
+    """원본이 다른 프로그램에 잠겨 읽기도 안 되는 경우: 손상으로 보지 않고 예전 위치를 기억해 다시 시도."""
+    from pathlib import Path
+
+    old, new = tmp_path / "old" / "data", tmp_path / "new" / "data"
+    st = Storage(tmp_path / "db.sqlite", old)
+    st.save_raw("KR_1", make_match("KR_1"), None)
+    real_read = Path.read_text
+    locked = {"on": True}
+
+    def read_text(self, *a, **k):
+        if locked["on"] and self.parent.parent == old:
+            raise PermissionError("다른 프로그램이 사용 중")
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    r = st.relocate_data(new)
+    assert r.moved == 0 and len(r.failed) == 1  # 성공으로 처리하지 않는다
+    assert st.fallback_dirs == [old]
+    assert (old / "matches" / "KR_1.json").exists()
+
+    locked["on"] = False  # 잠금 해제
+    assert st.load_match("KR_1") is not None  # 예전 위치에서 다시 읽힌다
+    r = st.import_data_from(old)  # 다음 실행 때의 재시도
+    assert r.moved == 1 and r.failed == [] and st.fallback_dirs == []
+    assert (new / "matches" / "KR_1.json").exists()
+
+
+def test_corrupt_source_is_skipped(tmp_path):
+    old, new = tmp_path / "old" / "data", tmp_path / "new" / "data"
+    (old / "matches").mkdir(parents=True)
+    (old / "matches" / "KR_9.json").write_text("{잘린", encoding="utf-8")
+    st = Storage(tmp_path / "db.sqlite", old)
+    r = st.relocate_data(new)
+    assert r.moved == 0 and r.failed == []  # 되살릴 수 없는 파일 때문에 계속 재시도하지 않음
+    assert not (new / "matches" / "KR_9.json").exists()
