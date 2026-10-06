@@ -90,13 +90,16 @@ class Dashboard(QWidget):
         self.empty_note.setObjectName("muted")
         top.addWidget(self.empty_note)
 
-        tiles = QGridLayout()
+        # 지표 칸: 창이 좁으면 여러 줄로 배치 (resizeEvent 에서 다시 배치)
+        self.tiles = QGridLayout()
         self.tile_vals: dict[str, QLabel] = {}
-        for i, name in enumerate(["경기", "승률", "KDA", "평균 K / D / A", "CS/분", "분당 딜량", "분당 골드",
-                                  "시야 점수", "킬 관여율"]):
+        self.tile_frames: list[QFrame] = []
+        for name in ["경기", "승률", "KDA", "평균 K / D / A", "CS/분", "분당 딜량", "분당 골드", "시야 점수", "킬 관여율"]:
             frame, val = _tile(name)
             self.tile_vals[name] = val
-            tiles.addWidget(frame, 0, i)
+            self.tile_frames.append(frame)
+        self._tile_cols = 0
+        self._layout_tiles(len(self.tile_frames))
 
         # 추세 차트
         self.trend_chart = QChart()
@@ -124,11 +127,32 @@ class Dashboard(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addLayout(top)
-        layout.addLayout(tiles)
+        layout.addLayout(self.tiles)
         layout.addLayout(charts, 3)
         layout.addWidget(QLabel("챔피언별 기록"))
         layout.addWidget(self.champ_table, 2)
         self.show_gold_diff(None)
+
+    TILE_MIN_WIDTH = 130  # 이보다 좁아지면 지표 칸을 다음 줄로 넘긴다
+
+    def _layout_tiles(self, cols: int) -> None:
+        cols = max(1, min(cols, len(self.tile_frames)))
+        if cols == self._tile_cols:
+            return
+        self._tile_cols = cols
+        for f in self.tile_frames:
+            self.tiles.removeWidget(f)
+        for i, f in enumerate(self.tile_frames):
+            self.tiles.addWidget(f, i // cols, i % cols)
+        for c in range(len(self.tile_frames)):
+            self.tiles.setColumnStretch(c, 1 if c < cols else 0)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        n = len(self.tile_frames)
+        fit = max(1, event.size().width() // self.TILE_MIN_WIDTH)
+        # 9개를 9 / 5 / 3 열로 (줄마다 개수가 고르게)
+        self._layout_tiles(next((c for c in (n, 5, 3) if c <= fit), 3))
 
     # ------------------------------------------------------------------ data
     def _load(self) -> list[analysis.GameSummary]:
@@ -253,7 +277,8 @@ class Dashboard(QWidget):
             if match and tl:
                 data = analysis.lane_gold_diff(match, tl, puuid or self.settings.puuid, riot_id or self.settings.riot_id)
         if not data:
-            chart.setTitle("라인 상대와 골드 차이 - 경기를 선택하세요 (API 데이터 필요)")
+            chart.setTitle("골드 차이 - 녹화 탭에서 경기를 선택하세요" if not match_id
+                           else "골드 차이 - 이 경기는 API 데이터가 없습니다")
             return
         zero = QLineSeries()
         line = QLineSeries()

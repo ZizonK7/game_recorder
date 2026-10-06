@@ -266,3 +266,24 @@ def test_settings_dialog_edits_copy_and_keeps_concurrent_changes(window, monkeyp
     window._open_settings()
     assert opened == [False]
     assert window.settings.fps == 60 and window.settings.puuid == "found-meanwhile"
+
+
+def test_window_fits_small_screens(window, qapp):
+    window.resize(1280, 720)
+    window.show()
+    qapp.processEvents()
+    assert window.minimumSizeHint().width() <= 1000  # 예전에는 1415px (1280px 화면을 넘음)
+    assert window.size().width() == 1280
+
+    window.player.btn_events.setChecked(False)  # 이벤트 패널 접기
+    assert not window.player.event_panel.isVisibleTo(window)
+    window.player.btn_events.setChecked(True)
+    assert window.player.event_panel.isVisibleTo(window)
+
+    window.tabs.setCurrentIndex(1)
+    window.resize(900, 600)
+    qapp.processEvents()
+    assert window.dashboard._tile_cols == 5  # 지표 9칸을 5 + 4 두 줄로
+    window.resize(1400, 800)
+    qapp.processEvents()
+    assert window.dashboard._tile_cols == 9

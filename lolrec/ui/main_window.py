@@ -15,7 +15,7 @@ import threading
 from PySide6.QtCore import QItemSelection, QItemSelectionModel, QRectF, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMainWindow, QMenu,
+    QAbstractItemView, QFileDialog, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMainWindow, QMenu,
     QMessageBox, QProgressDialog, QPushButton, QSplitter, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget,
     QVBoxLayout, QWidget,
 )
@@ -131,17 +131,18 @@ class MainWindow(QMainWindow):
 
         btn_import = QPushButton("과거 경기 가져오기")
         btn_import.clicked.connect(self._import_recent)
-        btn_export = QPushButton("Raw 데이터 내보내기")
-        btn_export.setObjectName("primary")
+        btn_export = QPushButton("데이터 내보내기")
+        btn_export.setToolTip("선택한 경기(없으면 전체)의 원본 API 데이터와 CSV 를 폴더로 내보내기")
         btn_export.clicked.connect(self._export)
         btn_folder = QPushButton("녹화 폴더")
         btn_folder.clicked.connect(lambda: open_folder(self.settings.recordings_path))
         btn_settings = QPushButton("설정")
         btn_settings.clicked.connect(self._open_settings)
-        btns = QHBoxLayout()
-        for b in (btn_import, btn_export, btn_folder, btn_settings):
-            btns.addWidget(b)
-        btns.addStretch()
+        # 버튼은 2x2 로 배치해 목록 패널이 좁아도 되게
+        btns = QGridLayout()
+        btns.setSpacing(6)
+        for i, b in enumerate((btn_folder, btn_settings, btn_import, btn_export)):
+            btns.addWidget(b, i // 2, i % 2)
 
         list_panel = QWidget()
         lv = QVBoxLayout(list_panel)

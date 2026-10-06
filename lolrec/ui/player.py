@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
 from ..events import DEFAULT_VISIBLE, EVENT_TYPES, GameEvent, load_events
 from .timeline import TimelineBar, fmt_time
 
+FILTER_COLUMNS = 4  # 이벤트 종류 필터 한 줄에 몇 개
+
 
 def _dot_icon(color: str) -> QIcon:
     pm = QPixmap(12, 12)
@@ -43,7 +45,7 @@ class PlayerView(QWidget):
         self.audio.setVolume(0.8)
         self.player.setAudioOutput(self.audio)
         self.video = QVideoWidget(self)
-        self.video.setMinimumSize(480, 270)
+        self.video.setMinimumSize(320, 180)
         self.video.setStyleSheet("background: black;")
         self.player.setVideoOutput(self.video)
 
@@ -58,9 +60,11 @@ class PlayerView(QWidget):
         self.btn_play = QPushButton("▶")
         self.btn_play.setFixedWidth(44)
         self.btn_play.clicked.connect(self.toggle_play)
-        self.btn_prev = QPushButton("◀ 이전 이벤트")
+        self.btn_prev = QPushButton("◀ 이전")
+        self.btn_prev.setToolTip("이전 이벤트로 이동 (,)")
         self.btn_prev.clicked.connect(lambda: self.step_event(-1))
-        self.btn_next = QPushButton("다음 이벤트 ▶")
+        self.btn_next = QPushButton("다음 ▶")
+        self.btn_next.setToolTip("다음 이벤트로 이동 (.)")
         self.btn_next.clicked.connect(lambda: self.step_event(1))
         self.btn_back = QPushButton("-5초")
         self.btn_back.clicked.connect(lambda: self.seek(self.current() - 5))
@@ -75,19 +79,36 @@ class PlayerView(QWidget):
         self.volume.setRange(0, 100)
         self.volume.setValue(80)
         self.volume.setFixedWidth(90)
+        self.volume.setToolTip("볼륨")
         self.volume.valueChanged.connect(lambda v: self.audio.setVolume(v / 100))
         self.time_label = QLabel("0:00 / 0:00")
         self.time_label.setObjectName("muted")
+        self.btn_events = QPushButton("이벤트 ▸")
+        self.btn_events.setCheckable(True)
+        self.btn_events.setChecked(True)
+        self.btn_events.setToolTip("오른쪽 이벤트 목록 보이기/숨기기 (작은 화면에서는 숨기면 영상이 커집니다)")
+        self.btn_events.toggled.connect(self.set_event_panel_visible)
 
-        controls = QHBoxLayout()
-        for w in (self.btn_play, self.btn_back, self.btn_fwd, self.btn_prev, self.btn_next):
-            controls.addWidget(w)
-        controls.addWidget(self.time_label)
-        controls.addStretch()
-        controls.addWidget(QLabel("속도"))
-        controls.addWidget(self.speed)
-        controls.addWidget(QLabel("볼륨"))
-        controls.addWidget(self.volume)
+        # 컨트롤은 두 줄: 재생/탐색/볼륨 + 이벤트 이동/속도/이벤트 패널 (작은 화면에서도 창 폭을 넓히지 않게)
+        row1 = QHBoxLayout()
+        for w in (self.btn_play, self.btn_back, self.btn_fwd):
+            row1.addWidget(w)
+        row1.addWidget(self.time_label)
+        row1.addStretch()
+        row1.addWidget(QLabel("🔊"))
+        row1.addWidget(self.volume)
+        row2 = QHBoxLayout()
+        row2.addWidget(self.btn_prev)
+        row2.addWidget(self.btn_next)
+        row2.addSpacing(8)
+        row2.addWidget(QLabel("속도"))
+        row2.addWidget(self.speed)
+        row2.addStretch()
+        row2.addWidget(self.btn_events)
+        controls = QVBoxLayout()
+        controls.setSpacing(4)
+        controls.addLayout(row1)
+        controls.addLayout(row2)
 
         # 이벤트 종류 필터
         filters = QGridLayout()
@@ -100,7 +121,7 @@ class PlayerView(QWidget):
                              f"QCheckBox::indicator:checked {{ background: {color}; }}")
             cb.toggled.connect(self._filters_changed)
             self.checks[etype] = cb
-            filters.addWidget(cb, i // 6, i % 6)
+            filters.addWidget(cb, i // FILTER_COLUMNS, i % FILTER_COLUMNS)
 
         left = QWidget()
         lv = QVBoxLayout(left)
@@ -112,10 +133,11 @@ class PlayerView(QWidget):
         lv.addLayout(filters)
 
         self.event_list = QListWidget()
-        self.event_list.setMinimumWidth(260)
+        self.event_list.setMinimumWidth(200)
         self.event_list.itemActivated.connect(lambda it: self.jump_to_event(it.data(Qt.UserRole)))
         self.event_list.itemClicked.connect(lambda it: self.jump_to_event(it.data(Qt.UserRole)))
         right = QWidget()
+        self.event_panel = right
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.addWidget(QLabel("이벤트"))
@@ -126,6 +148,7 @@ class PlayerView(QWidget):
         split.addWidget(right)
         split.setStretchFactor(0, 4)
         split.setStretchFactor(1, 1)
+        split.setCollapsible(0, False)
         split.setSizes([900, 280])
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -142,6 +165,12 @@ class PlayerView(QWidget):
             sc = QShortcut(QKeySequence(key), self)
             sc.setContext(Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(fn)
+
+    def set_event_panel_visible(self, visible: bool) -> None:
+        self.event_panel.setVisible(visible)
+        self.btn_events.setText("이벤트 ▸" if visible else "◂ 이벤트")
+        if self.btn_events.isChecked() != visible:
+            self.btn_events.setChecked(visible)
 
     # ------------------------------------------------------------------ loading
     def load(self, video: Path | None, events_file: Path | None, title: str) -> None:
