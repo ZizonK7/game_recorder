@@ -46,17 +46,33 @@ jobs:
           mkdir vendor
           cl /nologo /EHsc /O2 /std:c++17 /utf-8 /W3 native\audio_capture\main.cpp /Fe:vendor\lol_audio_capture.exe /link ole32.lib mmdevapi.lib
 
-      - name: Download FFmpeg (BtbN GPL build, 7.1)
+      - name: Download FFmpeg (latest stable BtbN GPL build)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
-          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          # 파일 이름이 버전마다 바뀌므로 release 의 asset 목록에서 최신 안정판(nX.Y)을 고른다
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "lolrec-ci" }
+          $rel = Invoke-RestMethod "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest" -Headers $headers
+          $assets = $rel.assets | Where-Object { $_.name -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-\d+\.\d+\.zip$' }
+          $asset = $assets | Sort-Object { [int]($_.name -replace '^ffmpeg-n(\d+)\.(\d+).*', '$1') * 100 + [int]($_.name -replace '^ffmpeg-n(\d+)\.(\d+).*', '$2') } -Descending | Select-Object -First 1
+          if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -eq 'ffmpeg-master-latest-win64-gpl.zip' } | Select-Object -First 1 }
+          if ($asset) {
+            Write-Host "FFmpeg: $($asset.name)"
+            Invoke-WebRequest $asset.browser_download_url -OutFile ffmpeg.zip
+          } else {
+            Write-Host "BtbN 빌드를 찾지 못해 gyan.dev 빌드 사용"
+            Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          }
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
           $bin = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           Copy-Item $bin.FullName vendor\
           Copy-Item (Join-Path $bin.DirectoryName "ffprobe.exe") vendor\
-          Copy-Item (Get-ChildItem ffmpeg_tmp -Recurse -Filter LICENSE.txt | Select-Object -First 1).FullName vendor\FFMPEG_LICENSE.txt
-          vendor\ffmpeg.exe -hide_banner -filters | Select-String "ddagrab|scale_cuda|scale_qsv"
+          $lic = Get-ChildItem ffmpeg_tmp -Recurse -Include LICENSE*, COPYING* | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName vendor\FFMPEG_LICENSE.txt }
+          vendor\ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          $filters = vendor\ffmpeg.exe -hide_banner -filters | Out-String
+          if ($filters -notmatch 'ddagrab') { throw "이 FFmpeg 빌드에는 ddagrab 이 없습니다" }
           vendor\ffmpeg.exe -hide_banner -encoders | Select-String "nvenc|amf|qsv|libx264"
 
       - name: Install Python packages
@@ -75,7 +91,7 @@ jobs:
           dist\LoLRecorder\_internal\bin\ffmpeg.exe -hide_banner -version | Select-Object -First 1
           $p = Start-Process dist\LoLRecorder\_internal\bin\lol_audio_capture.exe -ArgumentList "--pid","4","--pipe","\\.\pipe\lolrec_ci" -NoNewWindow -PassThru -RedirectStandardOutput helper.txt
           Start-Sleep 3; if (!$p.HasExited) { $p.Kill() }; Get-Content helper.txt
-          Copy-Item vendor\FFMPEG_LICENSE.txt dist\LoLRecorder\
+          if (Test-Path vendor\FFMPEG_LICENSE.txt) { Copy-Item vendor\FFMPEG_LICENSE.txt dist\LoLRecorder\ }
 
       - name: Version
         id: ver
