@@ -46,34 +46,45 @@ jobs:
           mkdir vendor
           cl /nologo /EHsc /O2 /std:c++17 /utf-8 /W3 native\audio_capture\main.cpp /Fe:vendor\lol_audio_capture.exe /link ole32.lib mmdevapi.lib
 
-      - name: Download FFmpeg (latest stable BtbN GPL build)
+      - name: Download FFmpeg (needs ddagrab + NVENC/AMF/QSV)
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 파일 이름이 버전마다 바뀌므로 release 의 asset 목록에서 최신 안정판(nX.Y)을 고른다
+          # 게임 성능을 위해 NVIDIA/AMD/Intel 하드웨어 인코더가 모두 들어 있는 빌드를 고른다.
+          # 후보를 차례로 받아보고 조건을 만족하는 첫 빌드를 사용.
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "lolrec-ci" }
-          $rel = Invoke-RestMethod "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest" -Headers $headers
-          $assets = $rel.assets | Where-Object { $_.name -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-\d+\.\d+\.zip$' }
-          $asset = $assets | Sort-Object { [int]($_.name -replace '^ffmpeg-n(\d+)\.(\d+).*', '$1') * 100 + [int]($_.name -replace '^ffmpeg-n(\d+)\.(\d+).*', '$2') } -Descending | Select-Object -First 1
-          if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -eq 'ffmpeg-master-latest-win64-gpl.zip' } | Select-Object -First 1 }
-          if ($asset) {
-            Write-Host "FFmpeg: $($asset.name)"
-            Invoke-WebRequest $asset.browser_download_url -OutFile ffmpeg.zip
-          } else {
-            Write-Host "BtbN 빌드를 찾지 못해 gyan.dev 빌드 사용"
-            Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          $candidates = @()
+          try {
+            $rel = Invoke-RestMethod "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest" -Headers $headers
+            $stable = $rel.assets | Where-Object { $_.name -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-gpl-\d+\.\d+\.zip$' } |
+              Sort-Object { [int]($_.name -replace '^ffmpeg-n(\d+)\.(\d+).*', '$1') * 100 + [int]($_.name -replace '^ffmpeg-n(\d+)\.(\d+).*', '$2') } -Descending
+            $candidates += $stable | ForEach-Object { $_.browser_download_url }
+            $candidates += ($rel.assets | Where-Object { $_.name -eq 'ffmpeg-master-latest-win64-gpl.zip' }).browser_download_url
+          } catch { Write-Host "BtbN release 조회 실패: $_" }
+          $candidates += "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          $candidates += "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.zip"
+          $chosen = $null
+          foreach ($url in ($candidates | Where-Object { $_ })) {
+            Write-Host "후보: $url"
+            Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force -ErrorAction SilentlyContinue
+            try { Invoke-WebRequest $url -OutFile ffmpeg.zip } catch { Write-Host "  다운로드 실패"; continue }
+            Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+            $bin = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+            if (-not $bin) { continue }
+            $enc = & $bin.FullName -hide_banner -encoders | Out-String
+            $flt = & $bin.FullName -hide_banner -filters | Out-String
+            $ok = ($flt -match 'ddagrab') -and ($enc -match 'h264_nvenc') -and ($enc -match 'h264_amf') -and ($enc -match 'h264_qsv') -and ($enc -match 'libx264')
+            Write-Host ("  ddagrab={0} nvenc={1} amf={2} qsv={3} x264={4}" -f ($flt -match 'ddagrab'), ($enc -match 'h264_nvenc'), ($enc -match 'h264_amf'), ($enc -match 'h264_qsv'), ($enc -match 'libx264'))
+            if ($ok) { $chosen = $bin; break }
           }
-          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
-          $bin = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-          Copy-Item $bin.FullName vendor\
-          Copy-Item (Join-Path $bin.DirectoryName "ffprobe.exe") vendor\
+          if (-not $chosen) { throw "조건(ddagrab + NVENC/AMF/QSV/x264)을 만족하는 FFmpeg 빌드를 찾지 못했습니다" }
+          Write-Host "선택: $($chosen.FullName)"
+          # shared 빌드면 DLL 도 함께 복사
+          Copy-Item (Join-Path $chosen.DirectoryName "*") vendor\ -Include *.exe, *.dll -Exclude ffplay.exe
           $lic = Get-ChildItem ffmpeg_tmp -Recurse -Include LICENSE*, COPYING* | Select-Object -First 1
           if ($lic) { Copy-Item $lic.FullName vendor\FFMPEG_LICENSE.txt }
           vendor\ffmpeg.exe -hide_banner -version | Select-Object -First 1
-          $filters = vendor\ffmpeg.exe -hide_banner -filters | Out-String
-          if ($filters -notmatch 'ddagrab') { throw "이 FFmpeg 빌드에는 ddagrab 이 없습니다" }
-          vendor\ffmpeg.exe -hide_banner -encoders | Select-String "nvenc|amf|qsv|libx264"
 
       - name: Install Python packages
         run: pip install -r requirements-dev.txt

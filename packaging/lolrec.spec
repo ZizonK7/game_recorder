@@ -7,6 +7,8 @@ VENDOR = ROOT / "vendor"
 
 binaries = [(str(VENDOR / name), "bin") for name in ("ffmpeg.exe", "ffprobe.exe", "lol_audio_capture.exe")
             if (VENDOR / name).exists()]
+# shared FFmpeg 빌드인 경우 필요한 DLL
+binaries += [(str(dll), "bin") for dll in VENDOR.glob("*.dll")]
 
 a = Analysis(
     [str(ROOT / "packaging" / "launcher.py")],
