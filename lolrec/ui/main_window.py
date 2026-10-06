@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import dataclasses
 import threading
 
 from PySide6.QtCore import QItemSelection, QItemSelectionModel, QRectF, Qt, Signal
@@ -25,7 +26,9 @@ from ..config import Settings, save_settings
 from ..exporter import export_games
 from ..fetcher import MatchFetcher
 from ..storage import GameRow, Storage
-from ..watcher import GameWatcher, PipelineCache, enforce_keep_recent, videos_over_keep
+from ..watcher import (
+    GameWatcher, PipelineCache, delete_videos, plan_keep_recent, plan_storage_limit,
+)
 from . import theme
 from .dashboard import Dashboard
 from .overlay import ReplayOverlay
@@ -361,50 +364,77 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "내보내기 완료", f"{len(games)}개 경기를 내보냈습니다.\n{out}\n\n{summary}")
         open_folder(out)
 
-    def _open_settings(self) -> None:
-        old = (self.settings.encoder, self.settings.fps, self.settings.bitrate_kbps, self.settings.resolution,
-               self.settings.monitor_index)
-        old_dir = self.settings.recordings_dir
-        old_keep = self.settings.keep_recent_videos
-        dlg = SettingsDialog(self.settings, self)
-        if dlg.exec():
-            if self.settings.recordings_dir != old_dir:
-                self._move_raw_data()
-            if self.settings.keep_recent_videos != old_keep and not self._apply_keep_recent():
-                self.settings.keep_recent_videos = old_keep
-            new = (self.settings.encoder, self.settings.fps, self.settings.bitrate_kbps, self.settings.resolution,
-                   self.settings.monitor_index)
-            if old != new:
-                self.pipelines.invalidate()
-            self._update_screen_size()
-            self.player.seek_lead = self.settings.seek_lead_sec
-            save_settings(self.settings)
-            try:
-                set_autostart(self.settings.launch_on_startup)
-            except OSError:
-                log.exception("자동 실행 설정 실패")
-            if self.watcher.recording and old != new:
-                self._set_status("녹화 설정 변경은 다음 게임부터 적용됩니다")
+    PIPELINE_FIELDS = ("encoder", "fps", "bitrate_kbps", "resolution", "monitor_index")
+    CLEANUP_FIELDS = ("keep_recent_videos", "max_storage_gb")
 
-    def _apply_keep_recent(self) -> bool:
-        """'최근 N경기만 보관'을 바로 적용. 지워질 영상이 있으면 먼저 확인받는다. 취소하면 False."""
-        keep = self.settings.keep_recent_videos
-        targets = videos_over_keep(self.storage, keep)
+    def _open_settings(self) -> None:
+        # 설정 창은 사본을 편집한다. 백그라운드 작업(영상 정리 등)은 여기서 반영한 값만 보게 된다.
+        snapshot = dataclasses.replace(self.settings)
+        draft = dataclasses.replace(self.settings)
+        if not SettingsDialog(draft, self).exec():
+            return
+        # 창이 열려 있는 동안 다른 곳에서 바뀐 값(puuid 등)을 덮어쓰지 않도록, 사용자가 바꾼 값만 반영
+        changed = {f.name: getattr(draft, f.name) for f in dataclasses.fields(draft)
+                   if getattr(draft, f.name) != getattr(snapshot, f.name)}
+        cleanup = None
+        if any(k in changed for k in self.CLEANUP_FIELDS):
+            cleanup = self._confirm_cleanup(draft)
+            if cleanup is None:  # 삭제를 거절하면 자동 삭제 설정은 바꾸지 않는다
+                for k in self.CLEANUP_FIELDS:
+                    changed.pop(k, None)
+        for k, v in changed.items():
+            setattr(self.settings, k, v)
+
+        if cleanup:
+            self._run_cleanup(cleanup)
+        if "recordings_dir" in changed:
+            self._move_raw_data()
+        pipeline_changed = any(k in changed for k in self.PIPELINE_FIELDS)
+        if pipeline_changed:
+            self.pipelines.invalidate()
+        self._update_screen_size()
+        self.player.seek_lead = self.settings.seek_lead_sec
+        save_settings(self.settings)
+        try:
+            set_autostart(self.settings.launch_on_startup)
+        except OSError:
+            log.exception("자동 실행 설정 실패")
+        if self.watcher.recording and pipeline_changed:
+            self._set_status("녹화 설정 변경은 다음 게임부터 적용됩니다")
+
+    def _confirm_cleanup(self, draft: Settings) -> list[GameRow] | None:
+        """새 자동 삭제 설정으로 지금 지워질 영상을 보여주고 확인받는다.
+        지울 영상이 없으면 [], 사용자가 거절하면 None."""
+        by_keep = plan_keep_recent(self.storage, draft.keep_recent_videos)
+        by_size, _ = plan_storage_limit(self.storage, draft.max_storage_gb)
+        targets = {g.id: g for g in by_keep + by_size}
         if not targets:
-            return True
-        oldest = min((g.started_dt for g in targets if g.started_dt), default=None)
-        since = f"\n(가장 오래된 영상: {oldest:%Y-%m-%d})" if oldest else ""
-        if QMessageBox.question(self, "영상 자동 삭제",
-                                f"최근 {keep}경기 영상만 남기고 이전 영상 {len(targets)}개를 지금 삭제합니다.{since}\n"
-                                "경기 기록과 통계는 유지됩니다. 계속할까요?") != QMessageBox.Yes:
-            return False
+            return []
+        reasons = []
+        if by_keep:
+            reasons.append(f"최근 {draft.keep_recent_videos}경기 보관: {len(by_keep)}개")
+        if by_size:
+            reasons.append(f"최대 {draft.max_storage_gb:g} GB 용량 제한: {len(by_size)}개")
+        oldest = min((g.started_dt for g in targets.values() if g.started_dt), default=None)
+        since = f"\n가장 오래된 영상: {oldest:%Y-%m-%d}" if oldest else ""
+        answer = QMessageBox.question(
+            self, "영상 자동 삭제",
+            f"새 설정을 적용하면 오래된 영상 {len(targets)}개가 지금 삭제됩니다.\n"
+            f"({', '.join(reasons)}){since}\n\n"
+            "경기 기록과 통계는 유지됩니다. 계속할까요?\n"
+            "'아니요'를 누르면 자동 삭제 설정은 바뀌지 않고, 나머지 설정만 저장됩니다.")
+        if answer != QMessageBox.Yes:
+            return None
+        return list(targets.values())
+
+    def _run_cleanup(self, targets: list[GameRow]) -> None:
         if self._loaded and any(g.id == self._loaded[0] for g in targets):
             self.player.unload()  # 재생 중인 파일은 지울 수 없음
             self._loaded = None
-        removed = enforce_keep_recent(self.storage, keep)
+        # 사용자가 확인한 영상만 지운다 (이후 새로 생긴 영상은 다음 정리 때 설정대로 처리)
+        removed = delete_videos(self.storage, targets, "자동 삭제 설정 변경으로 영상 삭제")
         self.refresh_list()
         self._set_status(f"오래된 영상 {len(removed)}개를 삭제했습니다")
-        return True
 
     def _move_raw_data(self) -> None:
         """저장 위치가 바뀌면 원본 API 데이터도 새 위치로 옮긴다 (기존 녹화 폴더는 그대로 둠)."""

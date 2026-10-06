@@ -17,6 +17,7 @@ def window(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(GameWatcher, "start", lambda self: None)
     monkeypatch.setattr(MatchFetcher, "start", lambda self: None)
     monkeypatch.setattr(mw, "save_settings", lambda s: None)
+    monkeypatch.setattr(mw, "set_autostart", lambda enabled: None)  # 실제 레지스트리를 건드리지 않게
     st = Storage(tmp_path / "db.sqlite", tmp_path / "rec" / "data")
     s = Settings(recordings_dir=str(tmp_path / "rec"))
     w = mw.MainWindow(s, st, (1920, 1080))
@@ -130,18 +131,81 @@ def test_quit_does_not_block_ui_while_finalizing(window, monkeypatch, qapp):
     assert quits == [1] and window._quit_dialog is None
 
 
-def test_keep_recent_setting_asks_before_deleting(window, monkeypatch, tmp_path):
-    st = window.storage
-    for day in range(1, 4):
+
+def _videos(st, tmp_path, n):
+    ids = []
+    for day in range(1, n + 1):
         f = tmp_path / f"g{day}"
         f.mkdir()
-        (f / "video.mp4").write_bytes(b"v")
-        st.create_game(folder=str(f), status="ready", video_path=str(f / "video.mp4"),
-                       started_at=f"2026-10-0{day}T20:00:00")
-    window.settings.keep_recent_videos = 1
-    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)
-    assert not window._apply_keep_recent()
+        (f / "video.mp4").write_bytes(b"v" * 1024)
+        ids.append(st.create_game(folder=str(f), status="ready", video_path=str(f / "video.mp4"),
+                                  started_at=f"2026-10-0{day}T20:00:00"))
+    return ids
+
+
+class _FakeDialog:
+    """설정 창 대신: 받은 설정(사본)을 바꾸고 저장 버튼을 누른 것처럼 동작."""
+    changes: dict = {}
+
+    def __init__(self, settings, parent=None):
+        self.settings = settings
+
+    def exec(self):
+        for k, v in self.changes.items():
+            setattr(self.settings, k, v)
+        return True
+
+
+def test_declining_cleanup_never_exposes_new_value(window, monkeypatch, tmp_path):
+    from lolrec.watcher import enforce_keep_recent
+
+    st = window.storage
+    _videos(st, tmp_path, 3)
+    _FakeDialog.changes = {"keep_recent_videos": 1, "replay_volume": 0.5}
+    monkeypatch.setattr(mw, "SettingsDialog", _FakeDialog)
+    seen = []
+
+    def question(*a, **k):
+        # 확인 창이 떠 있는 동안 백그라운드 영상 정리가 실행되는 상황
+        seen.append(window.settings.keep_recent_videos)
+        enforce_keep_recent(st, window.settings.keep_recent_videos)
+        return QMessageBox.No
+
+    monkeypatch.setattr(QMessageBox, "question", question)
+    window._open_settings()
+    assert seen == [0]  # 확인 전에는 새 값이 공개되지 않는다
     assert sum(g.has_video for g in st.list_games()) == 3
+    assert window.settings.keep_recent_videos == 0
+    assert window.settings.replay_volume == 0.5  # 나머지 설정은 저장
+
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
-    assert window._apply_keep_recent()
+    window._open_settings()
+    assert window.settings.keep_recent_videos == 1
     assert [g.has_video for g in st.list_games()] == [True, False, False]
+
+
+def test_lowering_storage_limit_also_asks(window, monkeypatch, tmp_path):
+    st = window.storage
+    _videos(st, tmp_path, 3)
+    _FakeDialog.changes = {"max_storage_gb": 2.5 * 1024 / 1024 ** 3}  # 영상 2.5개 분량
+    monkeypatch.setattr(mw, "SettingsDialog", _FakeDialog)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.No)
+    window._open_settings()
+    assert window.settings.max_storage_gb == 100.0
+    assert sum(g.has_video for g in st.list_games()) == 3
+
+
+def test_settings_dialog_edits_copy_and_keeps_concurrent_changes(window, monkeypatch):
+    _FakeDialog.changes = {"fps": 60}
+    opened = []
+
+    class Dialog(_FakeDialog):
+        def exec(self):
+            opened.append(self.settings is window.settings)
+            window.settings.puuid = "found-meanwhile"  # 창이 열린 동안 다른 작업이 바꾼 값
+            return super().exec()
+
+    monkeypatch.setattr(mw, "SettingsDialog", Dialog)
+    window._open_settings()
+    assert opened == [False]
+    assert window.settings.fps == 60 and window.settings.puuid == "found-meanwhile"

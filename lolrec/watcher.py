@@ -514,62 +514,77 @@ def folder_size(path: Path) -> int:
     return total
 
 
-def videos_over_keep(storage: Storage, keep: int) -> list[GameRow]:
-    """'최근 N경기 영상만 보관' 설정에 따라 지워질 (오래된) 영상 목록."""
+def plan_keep_recent(storage: Storage, keep: int) -> list[GameRow]:
+    """'최근 N경기 영상만 보관' 설정에 따라 지워질 영상 목록 (오래된 것부터).
+
+    같은 경기를 나눠 녹화한 영상(session 1, 2 ...)은 한 경기로 센다. match_id 가 없는 녹화는 각각 한 경기.
+    """
     if keep <= 0:
         return []
-    videos = [g for g in storage.list_games() if g.status == "ready" and g.has_video]
-    videos.sort(key=lambda g: g.started_at or "", reverse=True)
-    return videos[keep:]
+    groups: dict[str, list[GameRow]] = {}
+    for g in storage.list_games():
+        if g.status == "ready" and g.has_video:
+            groups.setdefault(g.match_id or f"row:{g.id}", []).append(g)
+    ordered = sorted(groups.values(), key=lambda rows: max(r.started_at or "" for r in rows), reverse=True)
+    old = [r for rows in ordered[keep:] for r in rows]
+    return sorted(old, key=lambda g: g.started_at or "")
 
 
-def enforce_keep_recent(storage: Storage, keep: int) -> list[int]:
-    """최근 keep 경기의 영상만 남기고 이전 영상은 삭제 (경기 기록/통계는 유지). 지운 game id 목록 반환."""
-    removed = []
-    for g in videos_over_keep(storage, keep):
-        try:
-            Path(g.video_path).unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:  # 재생 중이라 잠겨 있는 등 -> 다음에 다시 시도
-            log.warning("영상 자동 삭제 실패: %s", g.video_path, exc_info=True)
-            continue
-        storage.update_game(g.id, video_path=None, status="none", note=f"최근 {keep}경기만 보관 설정으로 영상 자동 삭제")
-        removed.append(g.id)
-    if removed:
-        log.info("최근 %d경기만 보관: 영상 %d개 삭제", keep, len(removed))
-    return removed
+def plan_storage_limit(storage: Storage, max_gb: float, reserve_bytes: int = 0) -> tuple[list[GameRow], bool]:
+    """용량 제한을 맞추려면 지워야 할 영상 목록 (오래된 것부터) 과, 그래도 제한을 넘는지.
 
-
-def enforce_storage_limit(storage: Storage, max_gb: float, reserve_bytes: int = 0) -> tuple[list[int], bool]:
-    """녹화 폴더들이 차지하는 전체 용량(조각, 임시 파일, 이벤트 포함)이 제한을 넘으면
-    오래된 완성 영상부터 삭제한다 (경기 데이터는 유지). reserve_bytes 는 곧 녹화할 분량.
-
-    반환: (영상을 지운 game id 목록, 지울 수 있는 영상을 다 지워도 제한을 넘는지)
+    녹화 폴더 전체(조각, 임시 파일, 이벤트 포함)를 센다. reserve_bytes 는 곧 녹화할 분량.
+    녹화/정리 중이거나 실패한(조각만 남은) 녹화는 자동으로 지우지 않는다.
     """
     if max_gb <= 0:
         return [], False
     games = storage.list_games()
-    folders = {}
-    for g in games:
-        if g.folder and Path(g.folder).is_dir():
-            folders.setdefault(str(Path(g.folder)), g)
+    folders = {str(Path(g.folder)) for g in games if g.folder and Path(g.folder).is_dir()}
     total = sum(folder_size(Path(f)) for f in folders) + reserve_bytes
     limit = max_gb * GB
-    removed = []
-    # 녹화/정리 중이거나 실패한(조각만 남은) 녹화는 자동으로 지우지 않는다
-    candidates = [g for g in games if g.status == "ready" and g.has_video]
-    for g in sorted(candidates, key=lambda g: g.started_at or ""):
+    targets = []
+    for g in sorted((g for g in games if g.status == "ready" and g.has_video), key=lambda g: g.started_at or ""):
         if total <= limit:
             break
         try:
-            size = Path(g.video_path).stat().st_size
-            Path(g.video_path).unlink()
-        except OSError:  # 재생 중이라 잠겨 있는 등
+            total -= Path(g.video_path).stat().st_size
+        except OSError:
             continue
-        total -= size
-        storage.update_game(g.id, video_path=None, status="none", note="용량 제한으로 영상 자동 삭제")
+        targets.append(g)
+    return targets, total > limit
+
+
+def delete_videos(storage: Storage, games: list[GameRow], note: str) -> list[int]:
+    """영상 파일만 지우고 경기 기록은 남긴다. 지운 game id 목록 반환 (잠긴 파일은 다음에 다시 시도)."""
+    removed = []
+    for g in games:
+        try:
+            Path(g.video_path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:  # 재생 중이라 잠겨 있는 등
+            log.warning("영상 자동 삭제 실패: %s", g.video_path, exc_info=True)
+            continue
+        storage.update_game(g.id, video_path=None, status="none", note=note)
         removed.append(g.id)
     if removed:
-        log.info("용량 제한으로 영상 %d개 삭제", len(removed))
-    return removed, total > limit
+        log.info("영상 %d개 자동 삭제 (%s)", len(removed), note)
+    return removed
+
+
+def enforce_keep_recent(storage: Storage, keep: int) -> list[int]:
+    """최근 keep 경기의 영상만 남기고 이전 영상은 삭제 (경기 기록/통계는 유지)."""
+    return delete_videos(storage, plan_keep_recent(storage, keep), f"최근 {keep}경기만 보관 설정으로 영상 자동 삭제")
+
+
+def enforce_storage_limit(storage: Storage, max_gb: float, reserve_bytes: int = 0) -> tuple[list[int], bool]:
+    """용량 제한을 넘으면 오래된 완성 영상부터 삭제 (경기 데이터는 유지).
+
+    반환: (영상을 지운 game id 목록, 지울 수 있는 영상을 다 지워도 제한을 넘는지)
+    """
+    targets, _ = plan_storage_limit(storage, max_gb, reserve_bytes)
+    removed = delete_videos(storage, targets, "용량 제한으로 영상 자동 삭제")
+    if len(removed) == len(targets):
+        _, over = plan_storage_limit(storage, max_gb, reserve_bytes)
+        return removed, over
+    return removed, True  # 잠긴 파일 등으로 일부를 못 지움

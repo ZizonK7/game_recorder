@@ -234,10 +234,31 @@ def test_keep_recent_videos(tmp_path):
     failed = st.create_game(folder=str(tmp_path / "g0"), status="failed", started_at="2026-09-01")
     assert watcher_mod.enforce_keep_recent(st, 0) == []
     removed = watcher_mod.enforce_keep_recent(st, 5)
-    assert removed == [ids[1], ids[0]]  # 가장 오래된 2경기
+    assert removed == [ids[0], ids[1]]  # 가장 오래된 2경기 (오래된 것부터)
     assert all(st.get_game(i).has_video for i in ids[2:])
     assert not (tmp_path / "g1" / "video.mp4").exists()
     g = st.get_game(ids[0])
     assert g.status == "none" and "최근 5경기" in g.note
     assert st.get_game(failed).status == "failed"
     assert watcher_mod.enforce_keep_recent(st, 5) == []
+
+
+def test_keep_recent_counts_matches_not_sessions(tmp_path):
+    st = Storage(tmp_path / "db.sqlite", tmp_path / "data")
+
+    def video(name, match_id, session, started):
+        f = tmp_path / name
+        f.mkdir()
+        (f / "video.mp4").write_bytes(b"v")
+        return st.create_game(folder=str(f), status="ready", video_path=str(f / "video.mp4"),
+                              match_id=match_id, session=session, started_at=started)
+
+    a = video("a", "KR_A", 1, "2026-10-01T20:00:00")
+    b1 = video("b1", "KR_B", 1, "2026-10-02T20:00:00")
+    b2 = video("b2", "KR_B", 2, "2026-10-02T20:10:00")
+    c = video("c", None, 1, "2026-09-01T20:00:00")  # match_id 없는 녹화는 각각 한 경기
+    assert watcher_mod.plan_keep_recent(st, 3) == []
+    assert [g.id for g in watcher_mod.plan_keep_recent(st, 2)] == [c]
+    assert [g.id for g in watcher_mod.plan_keep_recent(st, 1)] == [c, a]
+    assert watcher_mod.enforce_keep_recent(st, 1) == [c, a]
+    assert st.get_game(b1).has_video and st.get_game(b2).has_video
