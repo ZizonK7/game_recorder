@@ -7,13 +7,19 @@ import logging
 import shutil
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 RAW_SUBDIRS = ("matches", "timelines")
+
+
+@dataclass
+class MoveResult:
+    moved: int = 0
+    failed: list[Path] = field(default_factory=list)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
@@ -93,6 +99,8 @@ class Storage:
         self.data_dir = data_dir  # 원본 JSON 저장 위치
         self._lock = threading.Lock()
         self._data_lock = threading.RLock()  # 원본 JSON 이동 중 읽기/쓰기 방지
+        # 아직 옮기지 못한 파일이 남아 있는 예전 원본 JSON 위치 (읽기 전용으로 계속 찾아봄)
+        self.fallback_dirs: list[Path] = []
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
@@ -171,17 +179,30 @@ class Storage:
         return [GameRow(**dict(r)) for r in rows]
 
     # ------------------------------------------------------------------ raw json
+    def _raw_path(self, sub: str, name: str) -> Path:
+        """원본 JSON 경로. 현재 위치에 없고 아직 옮기지 못한 예전 위치에 있으면 그쪽을 돌려준다."""
+        primary = self.data_dir / sub / name
+        if primary.exists():
+            return primary
+        for d in self.fallback_dirs:
+            p = d / sub / name
+            if p.exists():
+                return p
+        return primary
+
     def match_json_path(self, match_id: str) -> Path:
-        return self.data_dir / "matches" / f"{match_id}.json"
+        return self._raw_path("matches", f"{match_id}.json")
 
     def timeline_json_path(self, match_id: str) -> Path:
-        return self.data_dir / "timelines" / f"{match_id}_timeline.json"
+        return self._raw_path("timelines", f"{match_id}_timeline.json")
 
     def save_raw(self, match_id: str, match: dict | None, timeline: dict | None) -> None:
         with self._data_lock:
-            for p, data in ((self.match_json_path(match_id), match), (self.timeline_json_path(match_id), timeline)):
+            for sub, name, data in (("matches", f"{match_id}.json", match),
+                                    ("timelines", f"{match_id}_timeline.json", timeline)):
                 if data is None:
                     continue
+                p = self.data_dir / sub / name  # 새 데이터는 항상 현재 위치에
                 p.parent.mkdir(parents=True, exist_ok=True)
                 tmp = p.with_name(p.name + ".tmp")
                 tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -199,40 +220,65 @@ class Storage:
 
     def delete_raw(self, match_id: str) -> None:
         with self._data_lock:
-            self.match_json_path(match_id).unlink(missing_ok=True)
-            self.timeline_json_path(match_id).unlink(missing_ok=True)
+            for d in (self.data_dir, *self.fallback_dirs):
+                (d / "matches" / f"{match_id}.json").unlink(missing_ok=True)
+                (d / "timelines" / f"{match_id}_timeline.json").unlink(missing_ok=True)
 
-    def relocate_data(self, new_dir: Path) -> int:
-        """원본 JSON 저장 위치를 바꾸고 기존 파일을 새 위치로 옮긴다. 옮긴 파일 수를 반환."""
+    def relocate_data(self, new_dir: Path) -> MoveResult:
+        """원본 JSON 저장 위치를 바꾸고 기존 파일을 새 위치로 옮긴다.
+
+        일부를 옮기지 못하면 예전 위치를 fallback_dirs 에 남겨 계속 읽을 수 있게 한다.
+        """
         with self._data_lock:
             old = self.data_dir
-            self.data_dir = new_dir
             new_dir.mkdir(parents=True, exist_ok=True)
-            return self.import_data_from(old)
+            self.data_dir = new_dir
+            if old not in self.fallback_dirs:
+                self.fallback_dirs.insert(0, old)
+            result = self.import_data_from(old)
+            # 다른 예전 위치에 남아 있던 파일도 이번에 다시 시도
+            for d in list(self.fallback_dirs):
+                if d != old:
+                    other = self.import_data_from(d)
+                    result.moved += other.moved
+                    result.failed += other.failed
+            return result
 
-    def import_data_from(self, old_dir: Path) -> int:
-        """다른 위치에 남아 있는 원본 JSON 을 현재 위치로 옮긴다 (같은 파일이 이미 있으면 그대로 둠)."""
-        moved = 0
+    def import_data_from(self, old_dir: Path) -> MoveResult:
+        """다른 위치에 남아 있는 원본 JSON 을 현재 위치로 옮긴다 (같은 파일이 이미 있으면 그대로 둠).
+
+        모두 옮겼으면 fallback_dirs 에서 빼고, 하나라도 못 옮겼으면 fallback_dirs 에 남긴다.
+        """
+        result = MoveResult()
         with self._data_lock:
             try:
                 if not old_dir.exists() or old_dir.resolve() == self.data_dir.resolve():
-                    return 0
+                    self._drop_fallback(old_dir)
+                    return result
             except OSError:
-                return 0
+                return result
             for sub in RAW_SUBDIRS:
                 src_dir, dst_dir = old_dir / sub, self.data_dir / sub
-                if not src_dir.is_dir():
+                try:
+                    if not src_dir.is_dir():
+                        continue
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+                    files = list(src_dir.glob("*.json"))
+                except OSError:
+                    log.warning("원본 데이터 폴더를 읽지 못함: %s", src_dir, exc_info=True)
+                    result.failed.append(src_dir)
                     continue
-                dst_dir.mkdir(parents=True, exist_ok=True)
-                for f in src_dir.glob("*.json"):
+                for f in files:
                     dst = dst_dir / f.name
                     if dst.exists():
-                        continue
+                        continue  # 이미 새 위치에 있음 (예전 파일은 그대로 둠)
                     try:
                         shutil.move(str(f), str(dst))
-                        moved += 1
+                        result.moved += 1
                     except OSError:
                         log.warning("원본 데이터 이동 실패: %s", f, exc_info=True)
+                        if not dst.exists():  # 복사까지 실패한 경우만 (복사 후 원본 삭제 실패는 읽을 수 있음)
+                            result.failed.append(f)
                 try:
                     src_dir.rmdir()  # 비었을 때만 지워진다
                 except OSError:
@@ -241,9 +287,20 @@ class Storage:
                 old_dir.rmdir()
             except OSError:
                 pass
-        if moved:
-            log.info("원본 데이터 %d개를 %s -> %s 로 옮김", moved, old_dir, self.data_dir)
-        return moved
+            if result.failed:
+                if old_dir not in self.fallback_dirs:
+                    self.fallback_dirs.append(old_dir)
+            else:
+                self._drop_fallback(old_dir)
+        if result.moved:
+            log.info("원본 데이터 %d개를 %s -> %s 로 옮김", result.moved, old_dir, self.data_dir)
+        if result.failed:
+            log.warning("원본 데이터 %d개를 옮기지 못해 예전 위치에서 계속 읽음: %s", len(result.failed), old_dir)
+        return result
+
+    def _drop_fallback(self, d: Path) -> None:
+        if d in self.fallback_dirs:
+            self.fallback_dirs.remove(d)
 
     def close(self) -> None:
         with self._lock:

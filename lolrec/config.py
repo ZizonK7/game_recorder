@@ -59,6 +59,7 @@ class Settings:
     # 내부 캐시 (인코더 자동 탐지 결과)
     detected_pipeline: dict = field(default_factory=dict)
     raw_data_dir: str = ""  # 마지막으로 원본 JSON 을 저장한 위치 (저장 위치 변경 시 이관용)
+    raw_data_fallbacks: list = field(default_factory=list)  # 옮기지 못한 파일이 남은 예전 위치들
 
     @property
     def recordings_path(self) -> Path:

@@ -93,16 +93,73 @@ def test_relocate_and_import_raw_data(tmp_path):
     old, new = tmp_path / "old" / "data", tmp_path / "new" / "data"
     st = Storage(tmp_path / "db.sqlite", old)
     st.save_raw("KR_1", make_match("KR_1"), make_timeline(minutes=2))
-    assert st.relocate_data(new) == 2
+    r = st.relocate_data(new)
+    assert r.moved == 2 and r.failed == [] and st.fallback_dirs == []
     assert st.load_match("KR_1") is not None
     assert not (old / "matches" / "KR_1.json").exists()
 
     # 예전 버전처럼 경로만 바뀐 채 재시작한 경우: 남은 파일을 가져온다
     st2 = Storage(tmp_path / "db2.sqlite", tmp_path / "newer" / "data")
     assert st2.load_match("KR_1") is None
-    assert st2.import_data_from(new) == 2
+    assert st2.import_data_from(new).moved == 2
     assert st2.load_match("KR_1") is not None and st2.load_timeline("KR_1") is not None
-    assert st2.import_data_from(st2.data_dir) == 0
+    assert st2.import_data_from(st2.data_dir).moved == 0
+
+
+def test_partial_relocation_keeps_reading_old_location(tmp_path, monkeypatch):
+    import shutil
+
+    from lolrec import storage as storage_mod
+
+    old, new = tmp_path / "old" / "data", tmp_path / "new" / "data"
+    st = Storage(tmp_path / "db.sqlite", old)
+    st.save_raw("KR_1", make_match("KR_1"), make_timeline(minutes=2))
+    st.save_raw("KR_2", make_match("KR_2"), None)
+    real_move = shutil.move
+
+    def locked(src, dst):
+        if "KR_1" in src:
+            raise PermissionError("다른 프로그램이 사용 중")
+        return real_move(src, dst)
+
+    monkeypatch.setattr(storage_mod.shutil, "move", locked)
+    r = st.relocate_data(new)
+    assert r.moved == 1 and len(r.failed) == 2  # KR_2 match 이동, KR_1 match/timeline 실패
+    assert st.data_dir == new and st.fallback_dirs == [old]
+    # 옮기지 못한 경기도 계속 읽히고, 옮긴 경기는 새 위치에서 읽힌다
+    assert st.load_match("KR_1") is not None and st.load_timeline("KR_1") is not None
+    assert st.match_json_path("KR_2").parent.parent == new
+    # 새로 받는 데이터는 새 위치에 저장
+    st.save_raw("KR_3", make_match("KR_3"), None)
+    assert (new / "matches" / "KR_3.json").exists()
+
+    # 다음 실행(잠금 해제 후): 예전 위치를 다시 시도해 모두 옮기면 fallback 에서 빠진다
+    monkeypatch.setattr(storage_mod.shutil, "move", real_move)
+    st2 = Storage(tmp_path / "db.sqlite", new)
+    assert st2.import_data_from(old).moved == 2
+    assert st2.fallback_dirs == [] and st2.load_match("KR_1") is not None
+    st.delete_raw("KR_1")
+    assert st2.load_match("KR_1") is None
+
+
+def test_move_raw_data_reports_failure_and_remembers_old_dir(window, monkeypatch, tmp_path):
+    import shutil
+
+    from lolrec import storage as storage_mod
+
+    st = window.storage
+    old = st.data_dir
+    st.save_raw("KR_1", make_match("KR_1"), None)
+    monkeypatch.setattr(storage_mod.shutil, "move", lambda s, d: (_ for _ in ()).throw(PermissionError("잠김")))
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: pytest.fail("성공으로 표시하면 안 됨"))
+    window.settings.recordings_dir = str(tmp_path / "moved")
+    window._move_raw_data()
+    assert warnings and "옮기지 못했습니다" in warnings[0]
+    assert window.settings.raw_data_fallbacks == [str(old)]
+    assert window.settings.raw_data_dir == str(tmp_path / "moved" / "data")
+    assert st.load_match("KR_1") is not None
 
 
 def test_quit_does_not_block_ui_while_finalizing(window, monkeypatch, qapp):

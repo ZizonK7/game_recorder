@@ -437,19 +437,29 @@ class MainWindow(QMainWindow):
         self._set_status(f"오래된 영상 {len(removed)}개를 삭제했습니다")
 
     def _move_raw_data(self) -> None:
-        """저장 위치가 바뀌면 원본 API 데이터도 새 위치로 옮긴다 (기존 녹화 폴더는 그대로 둠)."""
+        """저장 위치가 바뀌면 원본 API 데이터도 새 위치로 옮긴다 (기존 녹화 폴더는 그대로 둠).
+        옮기지 못한 파일은 예전 위치에서 계속 읽고, 다음 실행 때 다시 옮긴다."""
         new_dir = self.settings.raw_data_path
         try:
-            moved = self.storage.relocate_data(new_dir)
+            result = self.storage.relocate_data(new_dir)
         except OSError as e:
             log.exception("원본 데이터 이동 실패")
-            QMessageBox.warning(self, "저장 위치", f"원본 데이터를 새 위치로 옮기지 못했습니다: {e}\n"
-                                                  "다음 실행 때 다시 시도합니다.")
+            result = None
+            error = str(e)
+        self.settings.raw_data_dir = str(self.storage.data_dir)
+        self.settings.raw_data_fallbacks = [str(d) for d in self.storage.fallback_dirs]
+        if result is None or result.failed:
+            failed = f"{len(result.failed)}개" if result else "일부"
+            detail = f"\n오류: {error}" if result is None else ""
+            QMessageBox.warning(
+                self, "저장 위치",
+                f"원본 경기 데이터 {failed}를 새 위치로 옮기지 못했습니다.{detail}\n"
+                "다른 프로그램이 파일을 사용 중일 수 있습니다. 기존 위치에서 계속 읽으며, 다음 실행 때 다시 옮깁니다.\n"
+                f"기존 위치: {', '.join(self.settings.raw_data_fallbacks)}")
             return
-        self.settings.raw_data_dir = str(new_dir)
         QMessageBox.information(self, "저장 위치",
                                 f"새 녹화는 {self.settings.recordings_path} 에 저장됩니다.\n"
-                                f"원본 경기 데이터 {moved}개를 새 위치로 옮겼습니다.\n"
+                                f"원본 경기 데이터 {result.moved}개를 새 위치로 옮겼습니다.\n"
                                 "기존 녹화 영상은 원래 폴더에 그대로 남아 있습니다.")
 
     # ------------------------------------------------------------------ signals

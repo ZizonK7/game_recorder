@@ -75,16 +75,22 @@ def main() -> int:
     data_dir = settings.raw_data_path
     data_dir.mkdir(parents=True, exist_ok=True)
     storage = Storage(app_data_dir() / "games.db", data_dir)
-    # 저장 위치를 바꾼 적이 있으면 예전 위치에 남은 원본 데이터를 옮겨 온다
-    old_dirs = {Path(settings.raw_data_dir)} if settings.raw_data_dir else set()
-    old_dirs |= {Path(g.folder).parent / "data" for g in storage.list_games() if g.folder}
-    for old in old_dirs:
+    # 저장 위치를 바꾼 적이 있으면 예전 위치에 남은 원본 데이터를 옮겨 온다.
+    # 옮기지 못한 위치는 storage.fallback_dirs 에 남아 계속 읽히고, 다음 실행 때 다시 시도한다.
+    old_dirs = [Path(d) for d in settings.raw_data_fallbacks]
+    if settings.raw_data_dir:
+        old_dirs.append(Path(settings.raw_data_dir))
+    old_dirs += [Path(g.folder).parent / "data" for g in storage.list_games() if g.folder]
+    for old in dict.fromkeys(old_dirs):
         try:
             storage.import_data_from(old)
         except Exception:
             log.exception("예전 원본 데이터 이관 실패: %s", old)
-    if settings.raw_data_dir != str(data_dir):
+            storage.fallback_dirs.append(old)
+    fallbacks = [str(d) for d in storage.fallback_dirs]
+    if settings.raw_data_dir != str(data_dir) or settings.raw_data_fallbacks != fallbacks:
         settings.raw_data_dir = str(data_dir)
+        settings.raw_data_fallbacks = fallbacks
         save_settings(settings)
 
     size = screen_pixel_size(settings.monitor_index)
