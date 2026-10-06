@@ -160,6 +160,14 @@ class PlayerView(QWidget):
             self.player.setSource(QUrl())
             self.timeline.set_duration(0)
 
+    def reload_events(self, events_file: Path | None, title: str) -> None:
+        """재생 위치/상태는 그대로 두고 제목과 이벤트만 다시 읽는다 (타임라인 이벤트 추가 등)."""
+        self.title.setText(title)
+        events = load_events(events_file)[0] if events_file and events_file.exists() else []
+        self.events = sorted((e for e in events if e.video_time is not None), key=lambda e: e.video_time)
+        self.timeline.set_events(self.events, self.visible)
+        self._fill_list()
+
     def unload(self) -> None:
         self.player.stop()
         self.player.setSource(QUrl())

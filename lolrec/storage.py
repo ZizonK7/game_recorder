@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
+import shutil
 import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+RAW_SUBDIRS = ("matches", "timelines")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS games (
@@ -86,6 +92,7 @@ class Storage:
         self.db_path = db_path
         self.data_dir = data_dir  # 원본 JSON 저장 위치
         self._lock = threading.Lock()
+        self._data_lock = threading.RLock()  # 원본 JSON 이동 중 읽기/쓰기 방지
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
@@ -171,22 +178,72 @@ class Storage:
         return self.data_dir / "timelines" / f"{match_id}_timeline.json"
 
     def save_raw(self, match_id: str, match: dict | None, timeline: dict | None) -> None:
-        if match is not None:
-            p = self.match_json_path(match_id)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(match, ensure_ascii=False), encoding="utf-8")
-        if timeline is not None:
-            p = self.timeline_json_path(match_id)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(timeline, ensure_ascii=False), encoding="utf-8")
+        with self._data_lock:
+            for p, data in ((self.match_json_path(match_id), match), (self.timeline_json_path(match_id), timeline)):
+                if data is None:
+                    continue
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_name(p.name + ".tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(p)
 
     def load_match(self, match_id: str) -> dict | None:
-        p = self.match_json_path(match_id)
-        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+        with self._data_lock:
+            p = self.match_json_path(match_id)
+            return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
 
     def load_timeline(self, match_id: str) -> dict | None:
-        p = self.timeline_json_path(match_id)
-        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+        with self._data_lock:
+            p = self.timeline_json_path(match_id)
+            return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+
+    def delete_raw(self, match_id: str) -> None:
+        with self._data_lock:
+            self.match_json_path(match_id).unlink(missing_ok=True)
+            self.timeline_json_path(match_id).unlink(missing_ok=True)
+
+    def relocate_data(self, new_dir: Path) -> int:
+        """원본 JSON 저장 위치를 바꾸고 기존 파일을 새 위치로 옮긴다. 옮긴 파일 수를 반환."""
+        with self._data_lock:
+            old = self.data_dir
+            self.data_dir = new_dir
+            new_dir.mkdir(parents=True, exist_ok=True)
+            return self.import_data_from(old)
+
+    def import_data_from(self, old_dir: Path) -> int:
+        """다른 위치에 남아 있는 원본 JSON 을 현재 위치로 옮긴다 (같은 파일이 이미 있으면 그대로 둠)."""
+        moved = 0
+        with self._data_lock:
+            try:
+                if not old_dir.exists() or old_dir.resolve() == self.data_dir.resolve():
+                    return 0
+            except OSError:
+                return 0
+            for sub in RAW_SUBDIRS:
+                src_dir, dst_dir = old_dir / sub, self.data_dir / sub
+                if not src_dir.is_dir():
+                    continue
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                for f in src_dir.glob("*.json"):
+                    dst = dst_dir / f.name
+                    if dst.exists():
+                        continue
+                    try:
+                        shutil.move(str(f), str(dst))
+                        moved += 1
+                    except OSError:
+                        log.warning("원본 데이터 이동 실패: %s", f, exc_info=True)
+                try:
+                    src_dir.rmdir()  # 비었을 때만 지워진다
+                except OSError:
+                    pass
+            try:
+                old_dir.rmdir()
+            except OSError:
+                pass
+        if moved:
+            log.info("원본 데이터 %d개를 %s -> %s 로 옮김", moved, old_dir, self.data_dir)
+        return moved
 
     def close(self) -> None:
         with self._lock:

@@ -84,8 +84,7 @@ def _pump(seconds: float, until=lambda: False) -> None:
         time.sleep(0.02)
 
 
-def test_late_replay_is_dropped_after_respawn(tmp_path, monkeypatch):
-    app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+def test_late_replay_is_dropped_after_respawn(qapp, tmp_path, monkeypatch):
     w = _watcher(tmp_path)
     started, release = threading.Event(), threading.Event()
 

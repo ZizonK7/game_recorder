@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QItemSelection, QItemSelectionModel, QRectF, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMainWindow, QMenu,
@@ -109,6 +109,7 @@ class MainWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self._context_menu)
 
         self.player = PlayerView(settings.seek_lead_sec)
+        self._loaded: tuple[int, str | None] | None = None  # 플레이어에 열린 (game id, 영상 경로)
 
         btn_import = QPushButton("과거 경기 가져오기")
         btn_import.clicked.connect(self._import_recent)
@@ -183,8 +184,21 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ list
     def refresh_list(self) -> None:
-        selected = self._selected_ids()
+        """목록을 다시 그린다. 선택/스크롤/재생 상태는 유지한다."""
+        selected = set(self._selected_ids())
+        scroll = self.table.verticalScrollBar().value()
+        self.table.blockSignals(True)  # 다시 그리는 동안 선택 변경으로 영상이 다시 열리지 않게
+        try:
+            self._fill_table(selected)
+        finally:
+            self.table.blockSignals(False)
+        self.table.verticalScrollBar().setValue(scroll)
+        if set(self._selected_ids()) != selected:  # 선택했던 경기가 사라진 경우
+            self._on_select()
+
+    def _fill_table(self, selected: set[int]) -> None:
         self.table.setRowCount(0)
+        selection = QItemSelection()
         for g in self.storage.list_games():
             r = self.table.rowCount()
             self.table.insertRow(r)
@@ -206,9 +220,14 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.UserRole, g.id)
                 if c == 3 and g.win is not None:
                     item.setForeground(QColor(theme.WIN if g.win else theme.LOSS))
+                if g.note:
+                    item.setToolTip(g.note)
                 self.table.setItem(r, c, item)
             if g.id in selected:
-                self.table.selectRow(r)
+                model = self.table.model()
+                selection.select(model.index(r, 0), model.index(r, len(self.COLUMNS) - 1))
+        if not selection.isEmpty():
+            self.table.selectionModel().select(selection, QItemSelectionModel.ClearAndSelect)
 
     def _selected_ids(self) -> list[int]:
         rows = {i.row() for i in self.table.selectedIndexes()}
@@ -222,7 +241,8 @@ class MainWindow(QMainWindow):
     def _selected_games(self) -> list[GameRow]:
         return [g for g in (self.storage.get_game(i) for i in self._selected_ids()) if g]
 
-    def _on_select(self) -> None:
+    def _on_select(self, reload_events: bool = False) -> None:
+        """선택한 경기를 플레이어에 연다. 이미 열린 영상이면 재생 상태를 건드리지 않는다."""
         games = self._selected_games()
         if len(games) != 1:
             return
@@ -231,8 +251,16 @@ class MainWindow(QMainWindow):
         if g.win is not None:
             title += " · " + ("승리" if g.win else "패배")
         folder = Path(g.folder) if g.folder else None
-        self.player.load(Path(g.video_path) if g.has_video else None,
-                         folder / "events.json" if folder else None, title)
+        events_file = folder / "events.json" if folder else None
+        video = g.video_path if g.has_video else None
+        key = (g.id, video)
+        if key == self._loaded:
+            if reload_events:
+                self.player.reload_events(events_file, title)
+                self.dashboard.show_gold_diff(g.match_id, g.puuid or "", g.riot_id or "")
+            return
+        self._loaded = key
+        self.player.load(Path(video) if video else None, events_file, title)
         self.dashboard.show_gold_diff(g.match_id, g.puuid or "", g.riot_id or "")
 
     def _context_menu(self, pos) -> None:
@@ -248,12 +276,19 @@ class MainWindow(QMainWindow):
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _delete(self, games: list[GameRow], keep_data: bool) -> None:
-        what = "영상" if keep_data else "영상과 경기 기록"
-        if QMessageBox.question(self, "삭제", f"선택한 {len(games)}개 경기의 {what}을(를) 삭제할까요?") != QMessageBox.Yes:
+        if keep_data:
+            msg = f"선택한 {len(games)}개 경기의 영상을 삭제할까요?\n경기 기록과 원본 데이터는 남습니다."
+        else:
+            msg = (f"선택한 {len(games)}개 경기를 완전히 삭제할까요?\n"
+                   "영상, 녹화 폴더(이벤트 포함), 경기 기록, 원본 API 데이터(match/timeline JSON)가 모두 삭제됩니다.")
+        if QMessageBox.question(self, "삭제", msg) != QMessageBox.Yes:
             return
         self.player.unload()
+        self._loaded = None
+        skipped = 0
         for g in games:
             if g.status in ("recording", "processing"):
+                skipped += 1
                 continue
             if g.folder and Path(g.folder).exists():
                 if keep_data:
@@ -265,7 +300,12 @@ class MainWindow(QMainWindow):
                 self.storage.update_game(g.id, video_path=None, status="none")
             else:
                 self.storage.delete_game(g.id)
+                # 같은 경기를 이어서 녹화한 다른 행이 없을 때만 원본 데이터 삭제
+                if g.match_id and self.storage.find_by_match_id(g.match_id) is None:
+                    self.storage.delete_raw(g.match_id)
         self.refresh_list()
+        if skipped:
+            self._set_status(f"녹화/정리 중인 {skipped}개 경기는 삭제하지 않았습니다")
 
     # ------------------------------------------------------------------ actions
     def _import_recent(self) -> None:
@@ -294,8 +334,11 @@ class MainWindow(QMainWindow):
     def _open_settings(self) -> None:
         old = (self.settings.encoder, self.settings.fps, self.settings.bitrate_kbps, self.settings.resolution,
                self.settings.monitor_index)
+        old_dir = self.settings.recordings_dir
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec():
+            if self.settings.recordings_dir != old_dir:
+                self._move_raw_data()
             new = (self.settings.encoder, self.settings.fps, self.settings.bitrate_kbps, self.settings.resolution,
                    self.settings.monitor_index)
             if old != new:
@@ -308,6 +351,22 @@ class MainWindow(QMainWindow):
                 log.exception("자동 실행 설정 실패")
             if self.watcher.recording and old != new:
                 self._set_status("녹화 설정 변경은 다음 게임부터 적용됩니다")
+
+    def _move_raw_data(self) -> None:
+        """저장 위치가 바뀌면 원본 API 데이터도 새 위치로 옮긴다 (기존 녹화 폴더는 그대로 둠)."""
+        new_dir = self.settings.raw_data_path
+        try:
+            moved = self.storage.relocate_data(new_dir)
+        except OSError as e:
+            log.exception("원본 데이터 이동 실패")
+            QMessageBox.warning(self, "저장 위치", f"원본 데이터를 새 위치로 옮기지 못했습니다: {e}\n"
+                                                  "다음 실행 때 다시 시도합니다.")
+            return
+        self.settings.raw_data_dir = str(new_dir)
+        QMessageBox.information(self, "저장 위치",
+                                f"새 녹화는 {self.settings.recordings_path} 에 저장됩니다.\n"
+                                f"원본 경기 데이터 {moved}개를 새 위치로 옮겼습니다.\n"
+                                "기존 녹화 영상은 원래 폴더에 그대로 남아 있습니다.")
 
     # ------------------------------------------------------------------ signals
     def _set_status(self, text: str) -> None:
@@ -324,21 +383,20 @@ class MainWindow(QMainWindow):
         self.tray.setIcon(make_icon(True))
         self.refresh_list()
 
-    def _on_recording_finished(self, _gid: int) -> None:
+    def _on_recording_finished(self, gid: int) -> None:
         self.rec_label.setText("")
         self.tray.setIcon(make_icon(False))
         self.refresh_list()
+        if self._selected_ids() == [gid]:
+            self._on_select()  # 정리가 끝나 영상이 생겼으면 연다
 
     def _on_game_updated(self, gid: int) -> None:
         self.refresh_list()
         if self.tabs.currentIndex() == 1:
             self.dashboard.refresh()
-        ids = self._selected_ids()
-        if ids == [gid]:
-            # 타임라인 이벤트가 추가됐을 수 있으니 이벤트만 다시 읽기 (재생 위치 유지)
-            pos = self.player.current()
-            self._on_select()
-            QTimer.singleShot(300, lambda: self.player.seek(pos))
+        if self._selected_ids() == [gid]:
+            # 타임라인 이벤트가 추가됐을 수 있으니 이벤트만 다시 읽기 (재생 위치/상태 유지)
+            self._on_select(reload_events=True)
 
     # ------------------------------------------------------------------ window
     def show_normal(self) -> None:

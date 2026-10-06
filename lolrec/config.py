@@ -57,12 +57,18 @@ class Settings:
 
     # 내부 캐시 (인코더 자동 탐지 결과)
     detected_pipeline: dict = field(default_factory=dict)
+    raw_data_dir: str = ""  # 마지막으로 원본 JSON 을 저장한 위치 (저장 위치 변경 시 이관용)
 
     @property
     def recordings_path(self) -> Path:
         p = Path(self.recordings_dir)
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    @property
+    def raw_data_path(self) -> Path:
+        """원본 API JSON 위치: 녹화 저장 위치 아래 data 폴더."""
+        return self.recordings_path / "data"
 
     @property
     def target_height(self) -> int:

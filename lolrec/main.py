@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from . import APP_DISPLAY_NAME, APP_NAME
 from .paths import app_data_dir
@@ -45,7 +46,7 @@ def main() -> int:
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import QApplication, QMessageBox
 
-    from .config import load_settings
+    from .config import load_settings, save_settings
     from .paths import ffmpeg_path
     from .storage import Storage
     from .ui import theme
@@ -71,9 +72,20 @@ def main() -> int:
     server.listen(APP_NAME)
 
     settings = load_settings()
-    data_dir = settings.recordings_path / "data"
+    data_dir = settings.raw_data_path
     data_dir.mkdir(parents=True, exist_ok=True)
     storage = Storage(app_data_dir() / "games.db", data_dir)
+    # 저장 위치를 바꾼 적이 있으면 예전 위치에 남은 원본 데이터를 옮겨 온다
+    old_dirs = {Path(settings.raw_data_dir)} if settings.raw_data_dir else set()
+    old_dirs |= {Path(g.folder).parent / "data" for g in storage.list_games() if g.folder}
+    for old in old_dirs:
+        try:
+            storage.import_data_from(old)
+        except Exception:
+            log.exception("예전 원본 데이터 이관 실패: %s", old)
+    if settings.raw_data_dir != str(data_dir):
+        settings.raw_data_dir = str(data_dir)
+        save_settings(settings)
 
     screens = QGuiApplication.screens()
     idx = settings.monitor_index if settings.monitor_index < len(screens) else 0
