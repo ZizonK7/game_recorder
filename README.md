@@ -27,6 +27,17 @@
 - **우선순위**: 녹화 프로세스와 앱 모두 '낮음' 우선순위로 실행
 - **기본값**: 720p · 30fps · 5Mbps (30분 게임 약 1GB)
 
+### 인코더 관련 참고
+
+- **NVIDIA 그래픽카드는 최신 드라이버가 필요합니다.** 번들된 FFmpeg 이 요구하는 NVENC 버전보다 드라이버가
+  오래되면 NVENC 를 쓰지 못하고 (`%APPDATA%\LoLRecorder\lolrec.log` 에 `Driver does not support the required
+  nvenc API version` 기록), CPU 내장그래픽(AMD/Intel)이나 CPU 인코딩으로 넘어갑니다. 녹화는 되지만 더 무거우므로
+  NVIDIA App 에서 드라이버를 업데이트하세요. 업데이트 후 다음 실행 때 자동으로 NVENC 를 다시 탐지합니다.
+- 어떤 인코더를 쓰는지는 녹화 중 상태 표시줄의 `[nvenc-gpu]`, `[amf-cpuscale]` 같은 표시로 확인할 수 있습니다.
+- 데스 리플레이는 녹화를 2초 조각으로 나눠 저장하는 것에 의존합니다. 녹화 폴더의 `segments` 에 `seg_00000.ts`
+  하나만 계속 커지고 `segments.csv` 가 비어 있다면 인코더가 2초마다 키프레임을 만들지 않는 것이니 이슈로 알려 주세요.
+  (0.1.0 의 AMD AMF 인코더에서 이 문제가 있었고 수정되었습니다.)
+
 ## 설치
 
 GitHub Actions에서 빌드된 파일을 받습니다 (Actions → 최신 실행 → Artifacts).

@@ -26,6 +26,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 SEGMENT_SECONDS = 2
+# 파이프라인 인코더 옵션을 바꾸면 올린다. 설정에 캐시된 예전 탐지 결과(옛 옵션)를 다시 탐지하게 한다.
+PIPELINE_REVISION = 2
 AUDIO_RATE = 48000
 AUDIO_CHANNELS = 2
 
@@ -80,7 +82,10 @@ def build_pipelines(encoder: str, fps: int, bitrate_kbps: int,
     gop = ["-g", str(fps * SEGMENT_SECONDS), "-bf", "0"]
     nvenc = ["-c:v", "h264_nvenc", "-preset", "p2", "-tune", "ll", "-rc", "vbr", *rate, *gop]
     qsv = ["-c:v", "h264_qsv", "-preset", "veryfast", *rate, *gop]
-    amf = ["-c:v", "h264_amf", "-usage", "lowlatency", "-quality", "speed", "-rc", "vbr_peak", *rate, *gop]
+    # AMF 는 -forced_idr 없이는 강제 키프레임을 IDR 로 만들지 않아 첫 프레임 이후 키프레임이 없다
+    # (segment 가 나뉘지 않아 녹화 전체가 한 조각이 되고 데스 리플레이가 만들어지지 않음)
+    amf = ["-c:v", "h264_amf", "-usage", "lowlatency", "-quality", "speed", "-rc", "vbr_peak", *rate, *gop,
+           "-forced_idr", "1"]
     x264 = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", *rate, *gop,
             "-pix_fmt", "yuv420p"]
 

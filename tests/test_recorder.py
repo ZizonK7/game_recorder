@@ -31,6 +31,9 @@ def test_build_pipelines_order_and_options():
     assert nv.codec_args[nv.codec_args.index("-g") + 1] == "60"
     only_amf = [p.name for p in rec.build_pipelines("amf", 60, 5000, None)]
     assert only_amf == ["amf-gpu", "amf-cpuscale", "x264"]
+    # AMF 는 forced_idr 가 없으면 2초 키프레임이 생기지 않아 조각이 나뉘지 않는다
+    for p in rec.build_pipelines("amf", 30, 5000, None)[:2]:
+        assert p.codec_args[p.codec_args.index("-forced_idr") + 1] == "1"
     assert rec.build_pipelines("nvenc", 30, 5000, None)[0].vf is None
 
 

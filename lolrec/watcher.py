@@ -24,8 +24,8 @@ from .config import Settings, save_settings
 from .paths import audio_helper_path, ffmpeg_path
 from .recorder.audio import GameAudioCapture
 from .recorder.ffmpeg import (
-    FfmpegRecorder, Pipeline, RecorderConfig, build_replay_clip, concat_segments, detect_pipeline,
-    probe_duration, target_size,
+    PIPELINE_REVISION, FfmpegRecorder, Pipeline, RecorderConfig, build_replay_clip, concat_segments,
+    detect_pipeline, probe_duration, target_size,
 )
 from .riot.api import match_id_for, normalize_platform
 from .riot.local import GameSessionInfo, LcuClient, LiveClient, game_pid, game_window_mode, read_session
@@ -69,7 +69,8 @@ class PipelineCache:
 
     def key(self) -> str:
         s = self.settings
-        return f"{s.encoder}|{s.fps}|{s.bitrate_kbps}|{s.target_height}|{s.monitor_index}|{self.screen_size}"
+        return (f"r{PIPELINE_REVISION}|{s.encoder}|{s.fps}|{s.bitrate_kbps}|{s.target_height}|"
+                f"{s.monitor_index}|{self.screen_size}")
 
     def get(self, ffmpeg: Path) -> Pipeline | None:
         with self._lock:

@@ -1,6 +1,6 @@
 ; Inno Setup 설치 파일 스크립트 (CI 에서 iscc /DAppVersion=x.y.z packaging\installer.iss)
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.1.1"
 #endif
 
 [Setup]
